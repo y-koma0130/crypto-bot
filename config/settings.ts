@@ -85,7 +85,7 @@ export const RISK = {
   /** トレーリングストップ: 引き上げ後の損切りライン（建値からの%） */
   TRAILING_LOCK_STOP_PCT: 0.02,
   /** ATR フィルター: ATRが平均の何倍以上でトレンドとみなすか */
-  ATR_TREND_MULTIPLIER: 1.2,
+  ATR_TREND_MULTIPLIER: 1.1,
   /** 1トレードあたりのリスク = 資本の1% */
   RISK_PER_TRADE_PCT: 0.01,
   /** 同方向ポジション上限 */
@@ -97,17 +97,17 @@ export const RISK = {
 export const INDICATOR = {
   EMA_SHORT_PERIOD: 20,
   EMA_LONG_PERIOD: 50,
-  VOLUME_MULTIPLIER: 1.5,
+  VOLUME_MULTIPLIER: 1.2,
   VOLUME_LOOKBACK: 20,
   RSI_PERIOD: 14,
-  RSI_OVERSOLD: 25,
-  RSI_OVERBOUGHT: 75,
+  RSI_OVERSOLD: 30,
+  RSI_OVERBOUGHT: 70,
   RSI_NEUTRAL: 50,
   BB_PERIOD: 20,
   BB_STD_DEV: 2,
   ATR_PERIOD: 14,
-  /** BB幅がこれ以上ならトレンド中とみなしスキップ（4%） */
-  BB_SQUEEZE_THRESHOLD: 0.04,
+  /** BB幅がこれ以上ならトレンド中とみなしスキップ（6%） */
+  BB_SQUEEZE_THRESHOLD: 0.06,
   /** ADX計算期間 */
   ADX_PERIOD: 14,
   /** ADXがこれ以上ならトレンド相場 */

@@ -366,11 +366,10 @@ export function createMomentumBot(deps: {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error(BOT_NAME, `GPT regime check failed for ${pair}`, {
+      logger.warn(BOT_NAME, `GPT regime check failed for ${pair}, proceeding with technical signals only`, {
         error: message,
       });
-      // Conservative: skip entry if GPT is unavailable
-      return;
+      // Fallback: テクニカル条件が全て通過済みなのでGPTなしで続行
     }
 
     // Fetch current price from ticker (use ask for buy orders)

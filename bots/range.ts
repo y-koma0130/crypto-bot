@@ -383,11 +383,10 @@ export function createRangeBot(deps: {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error(BOT_NAME, `GPT news filter failed for ${pair}`, {
+      logger.warn(BOT_NAME, `GPT news filter failed for ${pair}, proceeding with technical signals only`, {
         error: message,
       });
-      // Conservative: skip entry if GPT is unavailable
-      return;
+      // Fallback: テクニカル条件が全て通過済みなのでGPTなしで続行
     }
 
     // Calculate position size
