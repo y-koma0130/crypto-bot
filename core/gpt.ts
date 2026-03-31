@@ -14,24 +14,30 @@ import type {
 
 // ── Prompt versions (centralized for version management) ──
 
-const PROMPT_VERSION = "v1.1";
+const PROMPT_VERSION = "v1.2";
 
 const SENTIMENT_SYSTEM_PROMPT = `You are a crypto market sentiment analyst (prompt ${PROMPT_VERSION}).
-Analyze the provided news headlines for the given trading pairs and determine overall market sentiment for EACH pair.
+Analyze the provided data for the given trading pairs and determine overall market sentiment for EACH pair.
+
+You will receive two types of data:
+1. **[Polymarket] prediction market data** — These show real-money bets on future outcomes with probabilities and volume. HEAVILY weight these signals as they represent aggregated market intelligence.
+2. **News headlines** — Traditional crypto news for context.
 
 You MUST respond with a JSON object where keys are trading pair symbols and values are objects with:
 - "level": one of "BULLISH", "NEUTRAL", "BEARISH", or "HALT"
-- "reasoning": a brief explanation (1 sentence)
+- "reasoning": a brief explanation (1 sentence, reference Polymarket data when relevant)
 
 Rules:
 - "HALT" means extreme risk events (exchange hacks, regulatory bans, black swan events) where all trading should stop.
-- "BEARISH" means predominantly negative news that suggests downward pressure.
-- "BULLISH" means predominantly positive news that suggests upward pressure.
-- "NEUTRAL" means mixed or insignificant news with no clear directional bias.
-- If no relevant news exists for a pair, set it to "NEUTRAL".
+- "BEARISH" means predominantly negative signals that suggest downward pressure.
+- "BULLISH" means predominantly positive signals that suggest upward pressure.
+- "NEUTRAL" means mixed or insignificant signals with no clear directional bias.
+- Polymarket probabilities above 65% for bullish outcomes (price increases, ETF approvals, etc.) should strongly bias toward BULLISH.
+- Polymarket probabilities above 65% for bearish outcomes (price drops, bans, etc.) should strongly bias toward BEARISH.
+- If no relevant data exists for a pair, set it to "NEUTRAL".
 
 Example response format:
-{"BTC/USDT":{"level":"BULLISH","reasoning":"..."},"ETH/USDT":{"level":"NEUTRAL","reasoning":"..."}}
+{"BTC/USDT":{"level":"BULLISH","reasoning":"Polymarket shows 72% probability of BTC above $100K, reinforced by positive ETF inflow news"},"ETH/USDT":{"level":"NEUTRAL","reasoning":"..."}}
 
 Respond ONLY with valid JSON.`;
 
@@ -51,16 +57,17 @@ Analysis guidelines:
 Respond ONLY with valid JSON.`;
 
 const NEWS_FILTER_SYSTEM_PROMPT = `You are a crypto trading signal filter (prompt ${PROMPT_VERSION}).
-Given a trading signal and recent news headlines, determine whether it is safe to act on the signal.
+Given a trading signal and recent data (news headlines and Polymarket prediction markets), determine whether it is safe to act on the signal.
 
 You MUST respond with a JSON object containing exactly these fields:
-- "safe": boolean (true if the signal is safe to act on, false if recent news contradicts or undermines it)
+- "safe": boolean (true if the signal is safe to act on, false if recent data contradicts or undermines it)
 - "reasoning": a brief explanation (1 sentence)
 
 Filter rules:
+- [Polymarket] entries show real-money prediction market probabilities. If a Polymarket outcome strongly contradicts the signal direction (>60% against), mark as unsafe.
 - If major news directly contradicts the signal direction, mark as unsafe (safe=false).
 - If there is a significant event (hack, delisting, regulatory action) affecting the pair, mark as unsafe.
-- If news is irrelevant or mildly supportive, mark as safe (safe=true).
+- If data is irrelevant or mildly supportive, mark as safe (safe=true).
 - When in doubt, err on the side of caution (safe=false).
 
 Respond ONLY with valid JSON.`;

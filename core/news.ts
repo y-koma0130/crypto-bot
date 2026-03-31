@@ -14,6 +14,9 @@ const PAIR_KEYWORDS: Record<TradingPair, readonly string[]> = {
   "SOL/USDT": ["solana", "sol"],
 };
 
+/** Polymarket のグローバルキーワード（全ペア共通の暗号市場関連マーケット） */
+const POLYMARKET_GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "stablecoin"] as const;
+
 /** 全ペアに共通するキーワード（市場全体に影響するニュース） */
 const GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "fed", "interest rate", "hack", "exploit"] as const;
 
@@ -24,15 +27,49 @@ export interface NewsFetcher {
   fetchNews(pair: TradingPair): Promise<string[]>;
 }
 
+// ── Polymarket Gamma API ──
+
+const POLYMARKET_API = "https://gamma-api.polymarket.com";
+
+interface PolymarketMarket {
+  readonly question: string;
+  readonly outcomePrices: string;
+  readonly outcomes: string;
+  readonly volume: string;
+  readonly active: boolean;
+}
+
+function formatPolymarketSignal(market: PolymarketMarket): string {
+  try {
+    const prices: number[] = JSON.parse(market.outcomePrices) as number[];
+    const outcomes: string[] = JSON.parse(market.outcomes) as string[];
+    const parts = outcomes.map((outcome, i) => {
+      const pct = ((prices[i] ?? 0) * 100).toFixed(0);
+      return `${outcome}: ${pct}%`;
+    });
+    const vol = Number(market.volume);
+    const volStr = vol >= 1_000_000
+      ? `$${(vol / 1_000_000).toFixed(1)}M`
+      : `$${(vol / 1_000).toFixed(0)}K`;
+    return `[Polymarket] ${market.question} (${parts.join(" / ")}, vol: ${volStr})`;
+  } catch {
+    return `[Polymarket] ${market.question}`;
+  }
+}
+
 export function createNewsFetcher(logger: Logger): NewsFetcher {
   const parser = new RSSParser({
     timeout: 15_000,
   });
 
-  // フィードのキャッシュ（全ペア共通、tick毎に1回だけフェッチ）
+  // RSSフィードのキャッシュ（全ペア共通、tick毎に1回だけフェッチ）
   let cachedArticles: { title: string; pubDate: number }[] = [];
   let lastFetchedAt = 0;
   const CACHE_TTL_MS = 10 * 60 * 1000; // 10分
+
+  // Polymarket キャッシュ
+  let cachedPolymarkets: PolymarketMarket[] = [];
+  let polymarketLastFetchedAt = 0;
 
   async function refreshCache(): Promise<void> {
     const now = Date.now();
@@ -70,11 +107,56 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
     logger.info("system", `RSS cache refreshed: ${articles.length} articles from ${RSS_FEEDS.length} feeds`);
   }
 
+  async function refreshPolymarketCache(): Promise<void> {
+    const now = Date.now();
+    if (now - polymarketLastFetchedAt < CACHE_TTL_MS && cachedPolymarkets.length > 0) {
+      return;
+    }
+
+    try {
+      const url = `${POLYMARKET_API}/markets?active=true&closed=false&limit=100&order=volume&ascending=false`;
+      const response = await fetch(url, {
+        headers: { "Accept": "application/json" },
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (!response.ok) {
+        logger.warn("system", `Polymarket API returned ${String(response.status)}`);
+        return;
+      }
+
+      const data = await response.json() as unknown;
+      if (!Array.isArray(data)) {
+        logger.warn("system", "Polymarket API returned unexpected format");
+        return;
+      }
+      cachedPolymarkets = (data as PolymarketMarket[]).filter((m) => m.active && m.question);
+      polymarketLastFetchedAt = now;
+      logger.info("system", `Polymarket cache refreshed: ${String(cachedPolymarkets.length)} active markets`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("system", "Polymarket fetch failed (non-critical)", { error: message });
+    }
+  }
+
+  function filterPolymarketByPair(pair: TradingPair): string[] {
+    const pairKeywords = PAIR_KEYWORDS[pair];
+    const allKeywords = [...pairKeywords, ...POLYMARKET_GLOBAL_KEYWORDS];
+
+    return cachedPolymarkets
+      .filter((market) => {
+        const questionLower = market.question.toLowerCase();
+        return allKeywords.some((kw) => questionLower.includes(kw));
+      })
+      .slice(0, 5)
+      .map((market) => formatPolymarketSignal(market));
+  }
+
   function filterByPair(pair: TradingPair): string[] {
     const now = Date.now();
     const keywords = PAIR_KEYWORDS[pair];
 
-    const filtered = cachedArticles
+    const newsArticles = cachedArticles
       .filter((article) => {
         if (now - article.pubDate > MAX_AGE_MS) return false;
 
@@ -86,17 +168,22 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
       .slice(0, 10)
       .map((article) => article.title);
 
-    logger.debug("system", `News filter for ${pair}: ${filtered.length} articles matched`, {
+    // Polymarket の予測市場データを先頭に追加（GPTに重視させるため）
+    const polymarketSignals = filterPolymarketByPair(pair);
+
+    const combined = [...polymarketSignals, ...newsArticles];
+
+    logger.debug("system", `News filter for ${pair}: ${String(newsArticles.length)} articles + ${String(polymarketSignals.length)} Polymarket signals`, {
       keywords: [...keywords, ...GLOBAL_KEYWORDS],
     });
 
-    return filtered;
+    return combined;
   }
 
   return {
     async fetchNews(pair: TradingPair): Promise<string[]> {
       try {
-        await refreshCache();
+        await Promise.allSettled([refreshCache(), refreshPolymarketCache()]);
         return filterByPair(pair);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
