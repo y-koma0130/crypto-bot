@@ -1,17 +1,22 @@
 # crypto-bot
 
 GPT-4o + テクニカル分析を組み合わせた仮想通貨トレードボット。
-3つの戦略ボットが協調して KuCoin 上で自動売買を行う。
+4つの戦略ボットが協調して KuCoin 上で自動売買を行う。
 
 ## ボット構成
 
 | ボット | 戦略 | 対象ペア | 間隔 |
 |---|---|---|---|
 | **Momentum** | コア: EMA(20/50) クロス + MACD / 参考(2/4): 出来高 + ATR + 4h MTF + GPT レジーム | BTC/USDT, ETH/USDT | 毎時 |
+| **Momentum Fast** | コア: EMA(5/13) クロス + MACD / 参考(1/2): 出来高 + ATR（GPT省略、速度優先） | BTC/USDT, ETH/USDT | 15分毎 |
 | **Range** | コア: RSI(30/70) 反転 + BB外側 / 参考(2/3): BB幅 + ADX(≤25) + GPT ニュース | XRP/USDT, SOL/USDT | 15分毎 |
 | **Sentiment** | RSS ニュース → GPT バッチ分析 + EMA(20) 確認（司令塔） | 全4ペア | 30分毎 |
 
-Sentiment Bot が `HALT` を出すと、他2ボットの新規エントリーをブロックする。日次損失が資本の -10% に達した場合も全ボットの新規エントリーを停止する。
+Sentiment Bot が `HALT` を出すと、他のボットの新規エントリーをブロックする。日次損失が資本の -10% に達した場合も全ボットの新規エントリーを停止する。
+
+### 損切りチェッカー
+
+全ボットのオープンポジションを **1分毎** に横断チェックする高頻度損切りタイマーを搭載。各ボットのtick間隔（15分〜1時間）に依存せず、急落時にも迅速に損切りを実行する。
 
 ### ショートポジション（先物）
 
@@ -20,6 +25,7 @@ Sentiment Bot が `HALT` を出すと、他2ボットの新規エントリーを
 | ボット | ロング（スポット） | ショート（先物） |
 |---|---|---|
 | **Momentum** | EMAクロスオーバー | EMAクロスアンダー + MACD < 0 |
+| **Momentum Fast** | EMA(5/13)クロスオーバー | EMA(5/13)クロスアンダー + MACD < 0 |
 | **Range** | RSI < 30 + BB下限 | RSI > 70 + BB上限 |
 | **Sentiment** | BULLISH + EMA(20)上 | BEARISH + EMA(20)下 |
 
@@ -33,11 +39,22 @@ Sentiment Bot が `HALT` を出すと、他2ボットの新規エントリーを
 |---|---|
 | 対象ペア | BTC/USDT, ETH/USDT |
 | 時間軸 | 1時間足（+ 4時間足で MTF 確認） |
-| 資金比率 | 40% |
+| 資金比率 | 30% |
 | エントリー条件（コア） | EMA(20) が EMA(50) を上抜け + MACD ヒストグラム > 0（全て必須） |
 | エントリー条件（参考） | 出来高 ≥ 20期間平均の1.2倍 / ATR 拡大（≥ 1.1倍） / 4h EMA(50) 上で推移 / GPT レジーム=TRENDING（4つ中2つ以上で実行） |
 | エグジット条件 | EMA(20) が EMA(50) を下抜け or トレーリングストップ発動 |
 | GPT 役割 | エントリー前にトレンド/レンジ判定（レンジなら参考指標で不通過扱い、1時間キャッシュ） |
+
+### Momentum Fast Bot 詳細
+
+| 項目 | 値 |
+|---|---|
+| 対象ペア | BTC/USDT, ETH/USDT |
+| 時間軸 | 15分足 |
+| 資金比率 | 10% |
+| エントリー条件（コア） | EMA(5) が EMA(13) をクロス + MACD ヒストグラム方向一致（全て必須） |
+| エントリー条件（参考） | 出来高 ≥ 20期間平均の1.2倍 / ATR 拡大（2つ中1つ以上で実行。GPT判定なし、速度優先） |
+| エグジット条件 | EMA(5) が EMA(13) を逆クロス or トレーリングストップ発動 |
 
 ### Range Bot 詳細
 
@@ -61,7 +78,7 @@ Sentiment Bot が `HALT` を出すと、他2ボットの新規エントリーを
 | GPT 出力 | `BULLISH` / `NEUTRAL` / `BEARISH` / `HALT` の4段階 |
 | ロングエントリー | GPT が BULLISH + 価格が EMA(20) の上で推移 |
 | ショートエントリー | GPT が BEARISH + 価格が EMA(20) の下で推移（先物経由、`FUTURES_ENABLED=true` 時のみ） |
-| HALT の場合 | Bot1/Bot2 の新規エントリーをブロック、既存ポジションは損切りラインで管理 |
+| HALT の場合 | 他の全ボットの新規エントリーをブロック、既存ポジションは損切りラインで管理 |
 | ニュースソース | CoinDesk + CoinTelegraph（RSS フィード、10分キャッシュ、6時間以内の記事のみ） |
 
 ## アーキテクチャ
@@ -69,9 +86,11 @@ Sentiment Bot が `HALT` を出すと、他2ボットの新規エントリーを
 ```
 main.ts (エントリーポイント)
  ├── node-cron スケジューラ（排他制御付き）
- ├── Bot1 Momentum ── EMA クロス + MACD（ロング/ショート両対応）
- ├── Bot2 Range    ── RSI(30/70) 反転 + BB（ロング: スポット / ショート: 先物）
- ├── Bot3 Sentiment ── RSS → GPT バッチ分析 + EMA(20)（BULLISH: ロング / BEARISH: ショート）
+ ├── Bot1 Momentum      ── EMA(20/50) クロス + MACD（1h足、ロング/ショート）
+ ├── Bot1-fast Momentum  ── EMA(5/13) クロス + MACD（15m足、GPT省略、速度優先）
+ ├── Bot2 Range          ── RSI(30/70) 反転 + BB（15m足、ロング: スポット / ショート: 先物）
+ ├── Bot3 Sentiment      ── RSS → GPT バッチ分析 + EMA(20)（BULLISH: ロング / BEARISH: ショート）
+ ├── Stop-loss checker   ── 1分毎に全ボットのポジションを横断チェック
  │
  ├── core/exchange.ts  ── ccxt (KuCoin スポット + 先物) / リトライ / スリッページ保護
  ├── core/gpt.ts       ── OpenAI API / バッチ分析 / キャッシュ
@@ -154,7 +173,8 @@ pnpm start:prod
 | 損切り | 初期 -5%（ATR 提供時は highWaterMark ± 2×ATR に動的変更） |
 | トレーリング: ブレークイーブン | 含み益 +3% で損切りを建値（+ 手数料分）に移動 |
 | トレーリング: 利益ロック | 含み益 +5% で損切りを建値 +2% に移動 |
-| 同時ポジション上限 | 各ボット 1、全体 3、同方向最大 2 |
+| 同時ポジション上限 | 各ボット 1、全体 4、同方向最大 2 |
+| 損切りチェック間隔 | 1分毎（全ボット横断、tick間隔に依存しない高頻度チェック） |
 | 日次損失上限 | 資本の -10%（超過で全ボット停止） |
 | 1トレードあたりのリスク | 資本の 1% |
 | 取引手数料 | 0.1%（PnL に反映） |
@@ -187,8 +207,9 @@ crypto-bot/
 ├── config/
 │   └── settings.ts          ボット設定・リスク定数・テクニカル指標パラメータ
 ├── bots/
-│   ├── momentum.ts          Bot1: EMA クロス + ATR フィルター
-│   ├── range.ts             Bot2: RSI 反転確認 + BB
+│   ├── momentum.ts          Bot1: EMA(20/50) クロス + MACD（1h足）
+│   ├── momentum-fast.ts     Bot1-fast: EMA(5/13) クロス + MACD（15m足）
+│   ├── range.ts             Bot2: RSI(30/70) 反転確認 + BB（15m足）
 │   └── sentiment.ts         Bot3: GPT ニュース分析（司令塔）
 ├── core/
 │   ├── exchange.ts          ccxt ラッパー（KuCoin）

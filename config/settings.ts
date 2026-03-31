@@ -54,7 +54,14 @@ export const MOMENTUM_CONFIG: BotConfig = {
   name: "momentum",
   pairs: ["BTC/USDT", "ETH/USDT"],
   timeframe: "1h",
-  capitalRatio: 0.4,
+  capitalRatio: 0.3,
+} as const;
+
+export const MOMENTUM_FAST_CONFIG: BotConfig = {
+  name: "momentum-fast",
+  pairs: ["BTC/USDT", "ETH/USDT"],
+  timeframe: "15m",
+  capitalRatio: 0.1,
 } as const;
 
 export const RANGE_CONFIG: BotConfig = {
@@ -79,7 +86,7 @@ export const RISK = {
   /** 各ボット最大同時ポジション数 */
   MAX_POSITIONS_PER_BOT: 1,
   /** ボット合計最大同時ポジション数 */
-  MAX_TOTAL_POSITIONS: 3,
+  MAX_TOTAL_POSITIONS: 4,
   /** 日次損失上限（-10%） */
   DAILY_LOSS_LIMIT_PCT: -0.10,
   /** KuCoin取引手数料（0.1%） */
@@ -120,4 +127,7 @@ export const INDICATOR = {
   ADX_PERIOD: 14,
   /** ADXがこれ以上ならトレンド相場 */
   ADX_TREND_THRESHOLD: 25,
+  /** 短期モメンタム用 EMA */
+  FAST_EMA_SHORT_PERIOD: 5,
+  FAST_EMA_LONG_PERIOD: 13,
 } as const;

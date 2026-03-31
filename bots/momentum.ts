@@ -146,7 +146,7 @@ export function calculateMACD(candles: readonly OHLCV[]): MACDResult {
  * series. A crossover means the short EMA was at-or-below the long on the
  * previous bar and is now above (and vice-versa for crossunder).
  */
-function detectSignal(
+export function detectSignal(
   emaShort: readonly number[],
   emaLong: readonly number[],
 ): EMASignal {
@@ -174,7 +174,7 @@ function detectSignal(
  * Check whether the latest confirmed candle's volume exceeds
  * VOLUME_MULTIPLIER times the average of the preceding VOLUME_LOOKBACK bars.
  */
-function isVolumeConfirmed(candles: readonly OHLCV[]): boolean {
+export function isVolumeConfirmed(candles: readonly OHLCV[]): boolean {
   if (candles.length < INDICATOR.VOLUME_LOOKBACK + 1) return false;
 
   const latest = candles[candles.length - 1];
@@ -198,6 +198,7 @@ export interface MomentumBot {
   tick(allPositions: readonly Position[]): Promise<void>;
   getPositions(): readonly Position[];
   restorePositions(trades: readonly TradeRecord[]): void;
+  checkStopLosses(): Promise<void>;
 }
 
 export function createMomentumBot(deps: {
@@ -214,6 +215,7 @@ export function createMomentumBot(deps: {
   // Mutable internal position state (closure)
   const positions: Position[] = [];
   const tradeIds = new Map<TradingPair, string>();
+  const lastAtr = new Map<TradingPair, number>();
 
   /** Number of candles to fetch: EMA_LONG_PERIOD + buffer */
   const CANDLE_LIMIT = INDICATOR.EMA_LONG_PERIOD + 10; // 60
@@ -517,8 +519,9 @@ export function createMomentumBot(deps: {
       currentPrice,
     });
 
-    // ATRを計算（トレーリングストップ用）
+    // ATRを計算（トレーリングストップ用 + checkStopLossesキャッシュ）
     const atr = calculateATR(candles, INDICATOR.ATR_PERIOD);
+    lastAtr.set(pair, atr);
 
     const existingPosition = findPosition(pair);
 
@@ -568,6 +571,25 @@ export function createMomentumBot(deps: {
         }
       }
       logger.info(BOT_NAME, `Restored ${openTrades.length} positions from DB`);
+    },
+
+    async checkStopLosses(): Promise<void> {
+      for (const position of [...positions]) {
+        try {
+          const ticker = await exchange.fetchTicker(position.pair);
+          const atr = lastAtr.get(position.pair);
+          if (shouldStopLoss(position, ticker.last, atr)) {
+            logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
+              entryPrice: position.entryPrice,
+              currentPrice: ticker.last,
+            });
+            await closePosition(position.pair, position, "stop-loss");
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error(BOT_NAME, `[rapid-check] Failed for ${position.pair}`, { error: message });
+        }
+      }
     },
   };
 }

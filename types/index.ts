@@ -65,7 +65,7 @@ export interface Position {
 
 // ── ボット ──
 
-export type BotName = "momentum" | "range" | "sentiment";
+export type BotName = "momentum" | "momentum-fast" | "range" | "sentiment";
 
 export interface BotConfig {
   readonly name: BotName;

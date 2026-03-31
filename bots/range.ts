@@ -17,6 +17,7 @@ export interface RangeBot {
   tick(allPositions: readonly Position[]): Promise<void>;
   getPositions(): readonly Position[];
   restorePositions(trades: readonly TradeRecord[]): void;
+  checkStopLosses(): Promise<void>;
 }
 
 // ── RSI calculation (Wilder's smoothing, pure function) ──
@@ -577,6 +578,24 @@ export function createRangeBot(deps: {
         }
       }
       logger.info(BOT_NAME, `Restored ${openTrades.length} positions from DB`);
+    },
+
+    async checkStopLosses(): Promise<void> {
+      for (const position of [...positions]) {
+        try {
+          const ticker = await exchange.fetchTicker(position.pair);
+          if (shouldStopLoss(position, ticker.last)) {
+            logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
+              entryPrice: position.entryPrice,
+              currentPrice: ticker.last,
+            });
+            await closePosition(position.pair, position, ticker.last, "stop-loss");
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error(BOT_NAME, `[rapid-check] Failed for ${position.pair}`, { error: message });
+        }
+      }
     },
   };
 }

@@ -20,6 +20,7 @@ export interface SentimentBot {
   restorePositions(trades: readonly TradeRecord[]): void;
   isHalted(): boolean;
   getLatestSentiment(): ReadonlyMap<TradingPair, SentimentResult>;
+  checkStopLosses(): Promise<void>;
 }
 
 // ── Dependencies ──
@@ -370,5 +371,6 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
     },
     isHalted,
     getLatestSentiment: () => new Map(sentimentMap),
+    checkStopLosses,
   };
 }

@@ -6,6 +6,7 @@ import { createGPTClient } from "./core/gpt.js";
 import { createRepository } from "./core/db.js";
 import { createNewsFetcher } from "./core/news.js";
 import { createMomentumBot } from "./bots/momentum.js";
+import { createMomentumFastBot } from "./bots/momentum-fast.js";
 import { createRangeBot } from "./bots/range.js";
 import { createSentimentBot } from "./bots/sentiment.js";
 import { isDailyLossLimitReached } from "./core/risk.js";
@@ -33,7 +34,9 @@ async function main(): Promise<void> {
 
   const sentimentMutex = createMutex();
   const momentumMutex = createMutex();
+  const momentumFastMutex = createMutex();
   const rangeMutex = createMutex();
+  // stopLossMutex は不要 — 各ボットのmutex内で実行して競合を防ぐ
 
   const config = loadEnvConfig();
   logger.info("system", `Environment: ${config.env}, DRY_RUN: ${config.dryRun}`);
@@ -60,6 +63,15 @@ async function main(): Promise<void> {
   });
 
   const momentumBot = createMomentumBot({
+    exchange,
+    gpt,
+    logger,
+    capitalUsd: config.totalCapital,
+    repo,
+    futuresExchange,
+  });
+
+  const momentumFastBot = createMomentumFastBot({
     exchange,
     gpt,
     logger,
@@ -107,6 +119,7 @@ async function main(): Promise<void> {
     return [
       ...sentimentBot.getPositions(),
       ...momentumBot.getPositions(),
+      ...momentumFastBot.getPositions(),
       ...rangeBot.getPositions(),
     ];
   }
@@ -182,6 +195,26 @@ async function main(): Promise<void> {
     }
   }
 
+  async function tickMomentumFast(): Promise<void> {
+    if (shuttingDown) return;
+    if (sentimentBot.isHalted()) {
+      logger.warn("momentum-fast", "Skipping tick — HALT active");
+      return;
+    }
+    if (await checkDailyLossLimit()) {
+      logger.warn("momentum-fast", "Skipping tick — daily loss limit reached");
+      return;
+    }
+    try {
+      await momentumFastBot.tick(getAllPositions());
+      updateBotStatus("momentum-fast", momentumFastBot.getPositions());
+      logger.info("momentum-fast", "Momentum-fast tick complete");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("momentum-fast", `Momentum-fast tick failed: ${message}`);
+    }
+  }
+
   async function tickRange(): Promise<void> {
     if (shuttingDown) return;
     if (sentimentBot.isHalted()) {
@@ -202,6 +235,19 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── 1分毎の高頻度損切りチェッカー（各ボットのmutex内で実行し競合を防ぐ） ──
+  async function tickStopLoss(): Promise<void> {
+    if (shuttingDown) return;
+    if (getAllPositions().length === 0) return;
+
+    await Promise.all([
+      momentumMutex.run(() => momentumBot.checkStopLosses()),
+      momentumFastMutex.run(() => momentumFastBot.checkStopLosses()),
+      rangeMutex.run(() => rangeBot.checkStopLosses()),
+      sentimentMutex.run(() => sentimentBot.checkStopLosses()),
+    ]);
+  }
+
   // ── スケジューリング ──
   // Bot3（センチメント）: 30分毎
   const cronSentiment = cron.schedule("*/30 * * * *", () => void sentimentMutex.run(tickSentiment));
@@ -209,8 +255,14 @@ async function main(): Promise<void> {
   // Bot1（モメンタム）: 1時間毎（1h足ベース）
   const cronMomentum = cron.schedule("5 * * * *", () => void momentumMutex.run(tickMomentum));
 
+  // Bot1-fast（短期モメンタム）: 15分毎（15m足ベース）
+  const cronMomentumFast = cron.schedule("*/15 * * * *", () => void momentumFastMutex.run(tickMomentumFast));
+
   // Bot2（レンジ）: 15分毎（15m足ベース）
   const cronRange = cron.schedule("*/15 * * * *", () => void rangeMutex.run(tickRange));
+
+  // 損切りチェッカー: 1分毎（各ボットのmutex内で実行）
+  const cronStopLoss = cron.schedule("* * * * *", () => void tickStopLoss());
 
   // ── Graceful shutdown ──
   async function shutdown(signal: string): Promise<void> {
@@ -221,13 +273,16 @@ async function main(): Promise<void> {
     // Stop cron jobs
     cronSentiment.stop();
     cronMomentum.stop();
+    cronMomentumFast.stop();
     cronRange.stop();
+    cronStopLoss.stop();
     logger.info("system", "Cron jobs stopped");
 
     // Update bot status to inactive
     await Promise.allSettled([
       repo.updateBotStatus({ bot_name: "sentiment", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
       repo.updateBotStatus({ bot_name: "momentum", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
+      repo.updateBotStatus({ bot_name: "momentum-fast", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
       repo.updateBotStatus({ bot_name: "range", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
     ]);
     logger.info("system", "Bot status updated to inactive");
@@ -240,20 +295,26 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
   // ── 起動時にDBからポジション復元 ──
-  const [sentimentTrades, momentumTrades, rangeTrades] = await Promise.all([
+  const [sentimentTrades, momentumTrades, momentumFastTrades, rangeTrades] = await Promise.all([
     repo.findOpenTrades("sentiment"),
     repo.findOpenTrades("momentum"),
+    repo.findOpenTrades("momentum-fast"),
     repo.findOpenTrades("range"),
   ]);
   sentimentBot.restorePositions(sentimentTrades);
   momentumBot.restorePositions(momentumTrades);
+  momentumFastBot.restorePositions(momentumFastTrades);
   rangeBot.restorePositions(rangeTrades);
 
   logger.info("system", "All cron jobs scheduled. Bot is running.");
 
   // 起動直後に1回実行（センチメント→他ボットの順で、HALT判定を先に行う）
   await sentimentMutex.run(tickSentiment);
-  await Promise.all([momentumMutex.run(tickMomentum), rangeMutex.run(tickRange)]);
+  await Promise.all([
+    momentumMutex.run(tickMomentum),
+    momentumFastMutex.run(tickMomentumFast),
+    rangeMutex.run(tickRange),
+  ]);
 
   logger.info("system", "Initial tick complete. Waiting for next cron triggers...");
 }
