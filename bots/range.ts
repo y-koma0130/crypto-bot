@@ -1,5 +1,6 @@
-import type {
-  Exchange, GPTClient, Logger, OHLCV, Position, TradingPair, BollingerBands, OrderSide, Repository, TradeRecord,
+import {
+  getOrderClient,
+  type Exchange, type FuturesExchange, type GPTClient, type Logger, type OHLCV, type Position, type TradingPair, type BollingerBands, type OrderSide, type Repository, type TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
 import { RANGE_CONFIG, INDICATOR } from "../config/settings.js";
@@ -212,8 +213,9 @@ export function createRangeBot(deps: {
   capitalUsd: number;
   repo: Repository;
   newsFetcher: NewsFetcher;
+  futuresExchange?: FuturesExchange;
 }): RangeBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange } = deps;
   const BOT_NAME = RANGE_CONFIG.name;
 
   /** RSI neutral zone tolerance (±5 around RSI_NEUTRAL) */
@@ -269,11 +271,11 @@ export function createRangeBot(deps: {
     currentPrice: number,
     reason: string,
   ): Promise<void> {
-    // Close side: opposite of position side
     const closeSide: OrderSide = position.side === "buy" ? "sell" : "buy";
+    const client = getOrderClient(position.side, exchange, futuresExchange);
 
     try {
-      const result = await exchange.createOrder({
+      const result = await client.createOrder({
         pair,
         side: closeSide,
         amount: position.amount,
@@ -408,15 +410,21 @@ export function createRangeBot(deps: {
       return;
     }
 
+    if (side === "sell" && !futuresExchange) {
+      logger.debug(BOT_NAME, `Futures not enabled, skipping sell entry on ${pair}`);
+      return;
+    }
+    const entryClient = getOrderClient(side, exchange, futuresExchange);
+
     // Execute order
     let fillPrice = currentPrice;
     try {
-      const result = await exchange.createOrder({
+      const result = await entryClient.createOrder({
         pair,
         side,
         amount,
       });
-      logger.info(BOT_NAME, `Opened ${side} position on ${pair}`, {
+      logger.info(BOT_NAME, `Opened ${side} position on ${pair}${side === "sell" ? " (futures)" : ""}`, {
         orderId: result.id,
         price: result.price,
         amount: result.amount,

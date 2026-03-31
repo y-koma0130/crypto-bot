@@ -144,6 +144,8 @@ async function main(): Promise<void> {
     dryRun: true,
     env: "test" as const,
     totalCapital: Number(process.env["TOTAL_CAPITAL"] ?? "1000"),
+    futuresEnabled: false,
+    futuresLeverage: 2,
   };
 
   const realExchange = createExchange(envConfig, logger);

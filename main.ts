@@ -1,7 +1,7 @@
 import cron from "node-cron";
 import { loadEnvConfig } from "./config/settings.js";
 import { createLogger } from "./core/logger.js";
-import { createExchange } from "./core/exchange.js";
+import { createExchange, createFuturesExchange } from "./core/exchange.js";
 import { createGPTClient } from "./core/gpt.js";
 import { createRepository } from "./core/db.js";
 import { createNewsFetcher } from "./core/news.js";
@@ -39,8 +39,13 @@ async function main(): Promise<void> {
   logger.info("system", `Environment: ${config.env}, DRY_RUN: ${config.dryRun}`);
 
   const exchange = createExchange(config, logger);
+  const futuresExchange = config.futuresEnabled ? createFuturesExchange(config, logger) : undefined;
   const gpt = createGPTClient(config, logger);
   const repo = createRepository(config, logger);
+
+  if (futuresExchange) {
+    logger.info("system", `Futures enabled (leverage: ${String(config.futuresLeverage)}x)`);
+  }
 
   const newsFetcher = createNewsFetcher(logger);
 
@@ -51,6 +56,7 @@ async function main(): Promise<void> {
     capitalUsd: config.totalCapital,
     repo,
     newsFetcher,
+    futuresExchange,
   });
 
   const momentumBot = createMomentumBot({
@@ -59,6 +65,7 @@ async function main(): Promise<void> {
     logger,
     capitalUsd: config.totalCapital,
     repo,
+    futuresExchange,
   });
 
   const rangeBot = createRangeBot({
@@ -68,6 +75,7 @@ async function main(): Promise<void> {
     capitalUsd: config.totalCapital,
     repo,
     newsFetcher,
+    futuresExchange,
   });
 
   // ── 起動時ヘルスチェック ──

@@ -1,6 +1,7 @@
 import { RISK } from "../config/settings.js";
 import type {
   Exchange,
+  FuturesExchange,
   OHLCV,
   OrderRequest,
   OrderResult,
@@ -140,6 +141,21 @@ export function createMockExchange(
         price: 0,
         timestamp: Date.now(),
       };
+    },
+  };
+}
+
+/**
+ * Create a mock FuturesExchange that shares the same candle data as the spot mock.
+ * Delegates to the spot mock for price/order execution.
+ */
+export function createMockFuturesExchange(spotMock: MockExchange): FuturesExchange {
+  return {
+    async fetchTicker(pair: TradingPair) {
+      return spotMock.fetchTicker(pair);
+    },
+    async createOrder(order: OrderRequest) {
+      return spotMock.createOrder(order);
     },
   };
 }

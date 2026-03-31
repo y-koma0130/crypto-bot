@@ -1,13 +1,15 @@
-import type {
-  Exchange,
-  GPTClient,
-  Logger,
-  OHLCV,
-  Position,
-  EMASignal,
-  TradingPair,
-  Repository,
-  TradeRecord,
+import {
+  getOrderClient,
+  type Exchange,
+  type FuturesExchange,
+  type GPTClient,
+  type Logger,
+  type OHLCV,
+  type Position,
+  type EMASignal,
+  type TradingPair,
+  type Repository,
+  type TradeRecord,
 } from "../types/index.js";
 import { MOMENTUM_CONFIG, INDICATOR } from "../config/settings.js";
 import {
@@ -204,8 +206,9 @@ export function createMomentumBot(deps: {
   logger: Logger;
   capitalUsd: number;
   repo: Repository;
+  futuresExchange?: FuturesExchange;
 }): MomentumBot {
-  const { exchange, gpt, logger, capitalUsd, repo } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, futuresExchange } = deps;
   const BOT_NAME = MOMENTUM_CONFIG.name;
 
   // Mutable internal position state (closure)
@@ -235,7 +238,7 @@ export function createMomentumBot(deps: {
   ): Promise<void> {
     // Stop-loss check
     if (shouldStopLoss(position, currentPrice, atr)) {
-      logger.warn(BOT_NAME, `Stop-loss triggered for ${pair}`, {
+      logger.warn(BOT_NAME, `Stop-loss triggered for ${pair} (${position.side})`, {
         entryPrice: position.entryPrice,
         currentPrice,
       });
@@ -243,13 +246,22 @@ export function createMomentumBot(deps: {
       return;
     }
 
-    // EMA crossunder exit
-    if (signal.crossUnder) {
-      logger.info(BOT_NAME, `EMA cross-under exit signal for ${pair}`, {
+    // ロング: EMAクロスアンダーで決済
+    if (position.side === "buy" && signal.crossUnder) {
+      logger.info(BOT_NAME, `EMA cross-under exit signal for ${pair} (long)`, {
         emaShort: signal.emaShort,
         emaLong: signal.emaLong,
       });
       await closePosition(pair, position, "cross-under");
+    }
+
+    // ショート: EMAクロスオーバーで決済
+    if (position.side === "sell" && signal.crossOver) {
+      logger.info(BOT_NAME, `EMA cross-over exit signal for ${pair} (short)`, {
+        emaShort: signal.emaShort,
+        emaLong: signal.emaLong,
+      });
+      await closePosition(pair, position, "cross-over");
     }
   }
 
@@ -258,13 +270,16 @@ export function createMomentumBot(deps: {
     position: Position,
     reason: string,
   ): Promise<void> {
+    const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
+    const client = getOrderClient(position.side, exchange, futuresExchange);
+
     try {
-      const result = await exchange.createOrder({
+      const result = await client.createOrder({
         pair,
-        side: "sell",
+        side: closeSide,
         amount: position.amount,
       });
-      logger.info(BOT_NAME, `Closed position on ${pair} (${reason})`, {
+      logger.info(BOT_NAME, `Closed ${position.side} position on ${pair} (${reason})`, {
         orderId: result.id,
         entryPrice: position.entryPrice,
         exitPrice: result.price,
@@ -283,7 +298,7 @@ export function createMomentumBot(deps: {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error(BOT_NAME, `Failed to close position on ${pair}`, {
+      logger.error(BOT_NAME, `Failed to close ${position.side} position on ${pair}`, {
         error: message,
       });
       return; // Keep position if the order failed
@@ -296,45 +311,26 @@ export function createMomentumBot(deps: {
   /** 参考指標の必要通過数 */
   const REQUIRED_SUPPLEMENTARY = 2;
 
-  async function tryEntry(
+  type EntryDirection = "long" | "short";
+
+  /**
+   * 参考指標を評価する（ロング/ショート共通）。
+   * MTF の比較方向のみ direction で分岐する。
+   */
+  async function evaluateSupplementary(
     pair: TradingPair,
-    signal: EMASignal,
     confirmedCandles: readonly OHLCV[],
-    allPositions: readonly Position[],
-  ): Promise<void> {
-    // ── コア条件（全て必須） ──
-
-    // 1. EMAクロスオーバー（モメンタム戦略の根幹）
-    if (!signal.crossOver) return;
-
-    // 2. MACDヒストグラム > 0（モメンタム方向の確認）
-    const macd = calculateMACD(confirmedCandles);
-    if (Number.isNaN(macd.histogram) || macd.histogram <= 0) {
-      logger.debug(BOT_NAME, `MACD histogram not positive for ${pair}, skipping entry`, {
-        histogram: macd.histogram,
-      });
-      return;
-    }
-
-    // 3. ポジション制限（リスク管理）
-    if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
-      logger.info(BOT_NAME, `Position limit reached, skipping ${pair}`);
-      return;
-    }
-
-    // ── 参考指標（4つ中2つ以上で実行） ──
-
+    direction: EntryDirection,
+  ): Promise<{ passed: boolean; passedCount: number }> {
     const supplementary: { name: string; passed: boolean }[] = [];
 
     // S1. 出来高確認
-    const volumeOk = isVolumeConfirmed(confirmedCandles);
-    supplementary.push({ name: "volume", passed: volumeOk });
+    supplementary.push({ name: "volume", passed: isVolumeConfirmed(confirmedCandles) });
 
     // S2. ATRボラティリティ拡大
-    const atrOk = isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD);
-    supplementary.push({ name: "atr", passed: atrOk });
+    supplementary.push({ name: "atr", passed: isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD) });
 
-    // S3. 4h EMA(50) 上位トレンド確認
+    // S3. 4h EMA(50) トレンド確認（ロング: 価格≥EMA / ショート: 価格<EMA）
     let mtfOk = false;
     try {
       const candles4h = await exchange.fetchOHLCV(pair, "4h", 55);
@@ -343,7 +339,9 @@ export function createMomentumBot(deps: {
         const latestEma4h = ema4h[ema4h.length - 1];
         const latest4hClose = candles4h[candles4h.length - 1]?.close;
         if (latestEma4h !== undefined && !Number.isNaN(latestEma4h) && latest4hClose !== undefined) {
-          mtfOk = latest4hClose >= latestEma4h;
+          mtfOk = direction === "long"
+            ? latest4hClose >= latestEma4h
+            : latest4hClose < latestEma4h;
         }
       }
     } catch (err: unknown) {
@@ -371,21 +369,59 @@ export function createMomentumBot(deps: {
     const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
     const failedNames = supplementary.filter((s) => !s.passed).map((s) => s.name);
 
-    logger.info(BOT_NAME, `Supplementary signals for ${pair}: ${String(passedCount)}/${String(supplementary.length)}`, {
+    logger.info(BOT_NAME, `${direction} supplementary signals for ${pair}: ${String(passedCount)}/${String(supplementary.length)}`, {
       passed: passedNames,
       failed: failedNames,
     });
 
-    if (passedCount < REQUIRED_SUPPLEMENTARY) {
-      logger.info(BOT_NAME, `Insufficient supplementary signals for ${pair} (${String(passedCount)}/${String(REQUIRED_SUPPLEMENTARY)} required), skipping`);
+    return { passed: passedCount >= REQUIRED_SUPPLEMENTARY, passedCount };
+  }
+
+  /**
+   * ロング/ショート共通エントリーロジック。
+   * コア条件チェック → 参考指標評価 → 注文実行。
+   */
+  async function tryDirectionalEntry(
+    pair: TradingPair,
+    signal: EMASignal,
+    confirmedCandles: readonly OHLCV[],
+    allPositions: readonly Position[],
+    direction: EntryDirection,
+  ): Promise<void> {
+    const isLong = direction === "long";
+    const side = isLong ? "buy" as const : "sell" as const;
+
+    // ショートは先物が必要
+    if (!isLong && !futuresExchange) return;
+
+    // コア条件1: EMAクロス（ロング: クロスオーバー / ショート: クロスアンダー）
+    if (isLong ? !signal.crossOver : !signal.crossUnder) return;
+
+    // コア条件2: MACDヒストグラム（ロング: > 0 / ショート: < 0）
+    const macd = calculateMACD(confirmedCandles);
+    if (Number.isNaN(macd.histogram)) return;
+    if (isLong ? macd.histogram <= 0 : macd.histogram >= 0) {
+      logger.debug(BOT_NAME, `MACD histogram not ${isLong ? "positive" : "negative"} for ${pair}, skipping ${direction}`, {
+        histogram: macd.histogram,
+      });
       return;
     }
 
-    // Fetch current price from ticker (use ask for buy orders)
-    const ticker = await exchange.fetchTicker(pair);
-    const entryPrice = ticker.ask;
+    // コア条件3: ポジション制限
+    if (!canOpenPosition(positions, BOT_NAME, allPositions, side)) {
+      logger.info(BOT_NAME, `Position limit reached, skipping ${direction} on ${pair}`);
+      return;
+    }
 
-    // Calculate position size
+    // 参考指標評価
+    const { passed } = await evaluateSupplementary(pair, confirmedCandles, direction);
+    if (!passed) return;
+
+    // 価格取得（ロング: ask / ショート: bid）
+    const client = getOrderClient(side, exchange, futuresExchange);
+    const ticker = await client.fetchTicker(pair);
+    const entryPrice = isLong ? ticker.ask : ticker.bid;
+
     const amount = calculatePositionSize({
       capitalUsd,
       capitalRatio: MOMENTUM_CONFIG.capitalRatio,
@@ -393,36 +429,42 @@ export function createMomentumBot(deps: {
     });
 
     if (amount <= 0) {
-      logger.warn(BOT_NAME, `Calculated position size is 0 for ${pair}`);
+      logger.warn(BOT_NAME, `Calculated position size is 0 for ${direction} on ${pair}`);
       return;
     }
 
-    // Execute order
     try {
-      const result = await exchange.createOrder({
-        pair,
-        side: "buy",
-        amount,
-      });
+      const result = await client.createOrder({ pair, side, amount });
 
-      const newPosition: Position = {
+      positions.push({
         pair,
-        side: "buy",
+        side,
         entryPrice: result.price,
         amount: result.amount,
         openedAt: result.timestamp,
         highWaterMark: result.price,
-      };
-      positions.push(newPosition);
+      });
 
-      logger.info(BOT_NAME, `Opened position on ${pair}`, {
+      logger.info(BOT_NAME, `Opened ${direction} position on ${pair}${isLong ? "" : " (futures)"}`, {
         orderId: result.id,
         price: result.price,
         amount: result.amount,
       });
+
+      void repo.insertTrade({
+        bot_name: BOT_NAME,
+        symbol: pair,
+        side,
+        amount: result.amount,
+        entry_price: result.price,
+        status: "open",
+      }).then((id) => { tradeIds.set(pair, id); }).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(BOT_NAME, "Failed to record trade", { error: msg });
+      });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error(BOT_NAME, `Failed to open position on ${pair}`, {
+      logger.error(BOT_NAME, `Failed to open ${direction} position on ${pair}`, {
         error: message,
       });
     }
@@ -449,8 +491,8 @@ export function createMomentumBot(deps: {
       return;
     }
 
-    // Drop the latest (unconfirmed) candle to avoid look-ahead bias
-    const candles = rawCandles.slice(0, -1);
+    // exchange.fetchOHLCV は未確定足を除外済みなのでそのまま使用
+    const candles = rawCandles;
 
     if (candles.length < INDICATOR.EMA_LONG_PERIOD + 1) {
       logger.warn(BOT_NAME, `Not enough confirmed candles for ${pair}`, {
@@ -483,7 +525,9 @@ export function createMomentumBot(deps: {
     if (existingPosition) {
       await tryExit(pair, existingPosition, signal, currentPrice, atr);
     } else {
-      await tryEntry(pair, signal, candles, allPositions);
+      // ロングとショートの両方を試行（コア条件で片方のみ通過する）
+      await tryDirectionalEntry(pair, signal, candles, allPositions, "long");
+      await tryDirectionalEntry(pair, signal, candles, allPositions, "short");
     }
   }
 

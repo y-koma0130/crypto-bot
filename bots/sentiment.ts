@@ -1,5 +1,6 @@
-import type {
-  Exchange, GPTClient, Logger, Position, SentimentResult, TradingPair, Repository, TradeRecord,
+import {
+  getOrderClient,
+  type Exchange, type FuturesExchange, type GPTClient, type Logger, type Position, type SentimentResult, type TradingPair, type Repository, type TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
 import { calculateEMA } from "./momentum.js";
@@ -30,12 +31,13 @@ interface SentimentBotDeps {
   readonly capitalUsd: number;
   readonly repo: Repository;
   readonly newsFetcher: NewsFetcher;
+  readonly futuresExchange?: FuturesExchange;
 }
 
 // ── Factory ──
 
 export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange } = deps;
   const BOT_NAME = SENTIMENT_CONFIG.name;
 
   let positions: Position[] = [];
@@ -186,12 +188,11 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
               }
             }
           } catch {
-            // テクニカルデータ取得失敗時はスキップ（安全側に倒す）
             logger.debug(BOT_NAME, `Failed to fetch technical data for ${pair}, skipping entry`);
             continue;
           }
 
-          await openPosition(pair, amount);
+          await openPosition(pair, "buy", amount);
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           logger.error(BOT_NAME, `Failed to open position for ${pair}`, {
@@ -200,14 +201,75 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
         }
       }
 
-      // BEARISH: consider closing existing buy position
-      if (sentiment.level === "BEARISH" && existingPosition) {
+      // BEARISH: close existing long, or open short via futures
+      if (sentiment.level === "BEARISH") {
+        if (existingPosition && existingPosition.side === "buy") {
+          try {
+            await closePosition(existingPosition);
+            positions = positions.filter((p) => p.pair !== pair);
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error(BOT_NAME, `Failed to close position for ${pair}`, {
+              error: message,
+            });
+          }
+        }
+
+        // ショートエントリー（先物経由）
+        if (!existingPosition && futuresExchange) {
+          if (!canOpenPosition(positions, BOT_NAME, allPositions, "sell")) {
+            logger.debug(BOT_NAME, `Cannot open short position for ${pair} — limit reached`);
+            continue;
+          }
+
+          try {
+            const ticker = await futuresExchange.fetchTicker(pair);
+            const price = ticker.bid;
+            const amount = calculatePositionSize({
+              capitalUsd: capitalUsd,
+              capitalRatio: SENTIMENT_CONFIG.capitalRatio,
+              price,
+            });
+
+            if (amount <= 0) {
+              logger.debug(BOT_NAME, `Calculated position size is 0 for short on ${pair}`);
+              continue;
+            }
+
+            // テクニカル確認: 価格がEMA(20)の下にある場合のみショートエントリー
+            try {
+              const candles = await exchange.fetchOHLCV(pair, SENTIMENT_CONFIG.timeframe, 25);
+              if (candles.length >= 20) {
+                const ema = calculateEMA(candles, 20);
+                const latestEma = ema[ema.length - 1];
+                if (latestEma !== undefined && !Number.isNaN(latestEma) && price > latestEma) {
+                  logger.debug(BOT_NAME, `Price above EMA(20) for ${pair}, skipping short entry`);
+                  continue;
+                }
+              }
+            } catch {
+              logger.debug(BOT_NAME, `Failed to fetch technical data for ${pair}, skipping short entry`);
+              continue;
+            }
+
+            await openPosition(pair, "sell", amount);
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error(BOT_NAME, `Failed to open short position for ${pair}`, {
+              error: message,
+            });
+          }
+        }
+      }
+
+      // BULLISH: close existing short position
+      if (sentiment.level === "BULLISH" && existingPosition && existingPosition.side === "sell") {
         try {
           await closePosition(existingPosition);
           positions = positions.filter((p) => p.pair !== pair);
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          logger.error(BOT_NAME, `Failed to close position for ${pair}`, {
+          logger.error(BOT_NAME, `Failed to close short position for ${pair}`, {
             error: message,
           });
         }
@@ -219,14 +281,16 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
   async function openPosition(
     pair: TradingPair,
+    side: "buy" | "sell",
     amount: number,
   ): Promise<void> {
-    const result = await exchange.createOrder({
+    const client = getOrderClient(side, exchange, futuresExchange);
+    const result = await client.createOrder({
       pair,
-      side: "buy",
+      side,
       amount,
     });
-    logger.info(BOT_NAME, `Opened BUY position on ${pair}`, {
+    logger.info(BOT_NAME, `Opened ${side.toUpperCase()} position on ${pair}${side === "sell" ? " (futures)" : ""}`, {
       orderId: result.id,
       amount: result.amount,
       price: result.price,
@@ -234,7 +298,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
     positions.push({
       pair,
-      side: "buy",
+      side,
       entryPrice: result.price,
       amount: result.amount,
       openedAt: Date.now(),
@@ -245,7 +309,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
     void repo.insertTrade({
       bot_name: BOT_NAME,
       symbol: pair,
-      side: "buy",
+      side,
       amount: result.amount,
       entry_price: result.price,
       status: "open",
@@ -258,9 +322,11 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
   async function closePosition(
     position: Position,
   ): Promise<void> {
-    const result = await exchange.createOrder({
+    const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
+    const closeClient = getOrderClient(position.side, exchange, futuresExchange);
+    const result = await closeClient.createOrder({
       pair: position.pair,
-      side: "sell",
+      side: closeSide,
       amount: position.amount,
     });
     logger.info(BOT_NAME, `Closed position on ${position.pair}`, {

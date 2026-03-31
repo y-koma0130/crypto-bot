@@ -1,8 +1,9 @@
-import ccxt, { type Order } from "ccxt";
+import ccxt, { type Order, type Ticker } from "ccxt";
 import { RISK } from "../config/settings.js";
 import type {
   EnvConfig,
   Exchange,
+  FuturesExchange,
   Logger,
   OHLCV,
   OrderRequest,
@@ -68,6 +69,146 @@ function mockOrderResult(order: OrderRequest, lastPrice: number): OrderResult {
   };
 }
 
+// ── 共通注文実行ロジック ──
+
+/** ccxt クライアントの注文関連メソッド */
+interface CcxtOrderClient {
+  fetchTicker(symbol: string): Promise<Ticker>;
+  fetchOrder(id: string, symbol?: string): Promise<Order>;
+  createOrder(symbol: string, type: string, side: string, amount: number, price?: number): Promise<Order>;
+}
+
+/** 注文の約定を待つ（最大30秒、指数バックオフでポーリング） */
+async function waitForFill(
+  client: CcxtOrderClient,
+  orderId: string,
+  symbol: string,
+  logger: Logger,
+  label: string,
+): Promise<Order> {
+  const MAX_WAIT_MS = 30_000;
+  const start = Date.now();
+  let interval = 2_000;
+
+  while (Date.now() - start < MAX_WAIT_MS) {
+    const order = await withRetry(
+      () => client.fetchOrder(orderId, symbol),
+      logger,
+      `${label}.fetchOrder(${orderId})`,
+    );
+
+    if (order.status === "closed" || order.status === "canceled" || order.status === "cancelled") {
+      return order;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, interval));
+    interval = Math.min(interval * 2, 10_000);
+  }
+
+  return await withRetry(
+    () => client.fetchOrder(orderId, symbol),
+    logger,
+    `${label}.fetchOrder(${orderId})`,
+  );
+}
+
+/**
+ * スリッページ保護付き注文実行。DRY_RUN対応。
+ * スポット・先物の共通ロジック。
+ */
+async function executeOrder(params: {
+  client: CcxtOrderClient;
+  order: OrderRequest;
+  symbol: string;
+  config: EnvConfig;
+  logger: Logger;
+  label: string;
+  extraLogData?: Record<string, unknown>;
+  preExecute?: () => Promise<void>;
+}): Promise<OrderResult> {
+  const { client, order, symbol, config, logger, label, extraLogData, preExecute } = params;
+
+  if (preExecute) {
+    await preExecute();
+  }
+
+  if (config.dryRun) {
+    const ticker = await withRetry(
+      () => client.fetchTicker(symbol),
+      logger,
+      `${label}.fetchTicker(${symbol})`,
+    );
+    const lastPrice = ticker.last ?? 0;
+    const result = mockOrderResult(order, lastPrice);
+
+    logger.info("system", `[DRY_RUN] ${label} order would be placed`, {
+      pair: order.pair,
+      side: order.side,
+      amount: order.amount,
+      price: result.price,
+      ...extraLogData,
+    });
+
+    return result;
+  }
+
+  // スリッページ保護: 成行注文の代わりに許容幅付き指値注文
+  let orderPrice = order.price;
+  let type: "limit" | "market" = order.price != null ? "limit" : "market";
+
+  if (type === "market") {
+    const ticker = await withRetry(
+      () => client.fetchTicker(symbol),
+      logger,
+      `${label}.fetchTicker(${symbol})`,
+    );
+    const slippage = RISK.SLIPPAGE_TOLERANCE_PCT;
+    if (order.side === "buy") {
+      orderPrice = (ticker.ask ?? 0) * (1 + slippage);
+    } else {
+      orderPrice = (ticker.bid ?? 0) * (1 - slippage);
+    }
+    type = "limit";
+  }
+
+  const ccxtOrder = await withRetry(
+    () => client.createOrder(symbol, type, order.side, order.amount, orderPrice),
+    logger,
+    `${label}.createOrder(${symbol})`,
+  );
+
+  const filledOrder = ccxtOrder.status === "closed"
+    ? ccxtOrder
+    : await waitForFill(client, ccxtOrder.id, symbol, logger, label);
+
+  if (filledOrder.status === "canceled" || filledOrder.status === "cancelled") {
+    logger.warn("system", `${label} order cancelled: ${filledOrder.id}`, { pair: order.pair });
+    throw new Error(`${label} order ${filledOrder.id} was cancelled`);
+  }
+
+  const result: OrderResult = {
+    id: filledOrder.id,
+    pair: order.pair,
+    side: order.side,
+    amount: filledOrder.filled ?? order.amount,
+    price: filledOrder.average ?? filledOrder.price ?? 0,
+    timestamp: filledOrder.timestamp ?? Date.now(),
+  };
+
+  logger.info("system", `${label} order executed`, {
+    id: result.id,
+    pair: result.pair,
+    side: result.side,
+    amount: result.amount,
+    price: result.price,
+    ...extraLogData,
+  });
+
+  return result;
+}
+
+// ── スポット Exchange ──
+
 /**
  * Exchange インターフェースの実装を生成するファクトリ。
  *
@@ -81,35 +222,6 @@ export function createExchange(config: EnvConfig, logger: Logger): Exchange {
     secret: config.kucoinApiSecret,
     password: config.kucoinPassphrase,
   });
-
-  /** 注文の約定を待つ（最大30秒、指数バックオフでポーリング） */
-  async function waitForFill(orderId: string, pair: string): Promise<Order> {
-    const MAX_WAIT_MS = 30_000;
-    const start = Date.now();
-    let interval = 2_000;
-
-    while (Date.now() - start < MAX_WAIT_MS) {
-      const order = await withRetry(
-        () => kucoin.fetchOrder(orderId, pair),
-        logger,
-        `fetchOrder(${orderId})`,
-      );
-
-      if (order.status === "closed" || order.status === "canceled" || order.status === "cancelled") {
-        return order;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, interval));
-      interval = Math.min(interval * 2, 10_000);
-    }
-
-    // タイムアウト: 最終状態を取得して返す
-    return await withRetry(
-      () => kucoin.fetchOrder(orderId, pair),
-      logger,
-      `fetchOrder(${orderId})`,
-    );
-  }
 
   return {
     async fetchOHLCV(
@@ -183,79 +295,14 @@ export function createExchange(config: EnvConfig, logger: Logger): Exchange {
     },
 
     async createOrder(order: OrderRequest): Promise<OrderResult> {
-      if (config.dryRun) {
-        const ticker = await withRetry(
-          () => kucoin.fetchTicker(order.pair),
-          logger,
-          `fetchTicker(${order.pair})`,
-        );
-        const lastPrice = ticker.last ?? 0;
-        const result = mockOrderResult(order, lastPrice);
-
-        logger.info("system", "[DRY_RUN] Order would be placed", {
-          pair: order.pair,
-          side: order.side,
-          amount: order.amount,
-          price: result.price,
-        });
-
-        return result;
-      }
-
-      // スリッページ保護: 成行注文の代わりに、許容幅付き指値注文を使用
-      let orderPrice = order.price;
-      let type: "limit" | "market" = order.price != null ? "limit" : "market";
-
-      if (type === "market") {
-        // 現在価格にスリッページ許容幅を加算/減算した指値に変換
-        const ticker = await withRetry(
-          () => kucoin.fetchTicker(order.pair),
-          logger,
-          `fetchTicker(${order.pair})`,
-        );
-        const slippage = RISK.SLIPPAGE_TOLERANCE_PCT;
-        if (order.side === "buy") {
-          orderPrice = (ticker.ask ?? 0) * (1 + slippage);
-        } else {
-          orderPrice = (ticker.bid ?? 0) * (1 - slippage);
-        }
-        type = "limit";
-      }
-
-      const ccxtOrder = await withRetry(
-        () => kucoin.createOrder(order.pair, type, order.side, order.amount, orderPrice),
+      return executeOrder({
+        client: kucoin,
+        order,
+        symbol: order.pair,
+        config,
         logger,
-        `createOrder(${order.pair})`,
-      );
-
-      // 約定を待つ（指値注文の場合）
-      const filledOrder = ccxtOrder.status === "closed"
-        ? ccxtOrder
-        : await waitForFill(ccxtOrder.id, order.pair);
-
-      if (filledOrder.status === "canceled" || filledOrder.status === "cancelled") {
-        logger.warn("system", `Order cancelled: ${filledOrder.id}`, { pair: order.pair });
-        throw new Error(`Order ${filledOrder.id} was cancelled`);
-      }
-
-      const result: OrderResult = {
-        id: filledOrder.id,
-        pair: order.pair,
-        side: order.side,
-        amount: filledOrder.filled ?? order.amount,
-        price: filledOrder.average ?? filledOrder.price ?? 0,
-        timestamp: filledOrder.timestamp ?? Date.now(),
-      };
-
-      logger.info("system", "Order executed", {
-        id: result.id,
-        pair: result.pair,
-        side: result.side,
-        amount: result.amount,
-        price: result.price,
+        label: "Spot",
       });
-
-      return result;
     },
 
     async fetchOrder(orderId: string, pair: TradingPair): Promise<OrderResult> {
@@ -273,6 +320,84 @@ export function createExchange(config: EnvConfig, logger: Logger): Exchange {
         price: order.average ?? order.price ?? 0,
         timestamp: order.timestamp ?? Date.now(),
       };
+    },
+  };
+}
+
+// ── 先物 Exchange ──
+
+/**
+ * スポットの TradingPair を先物シンボルに変換する。
+ * KuCoin 先物の USDT-M ペアは "BTC/USDT:USDT" 形式。
+ */
+function toFuturesSymbol(pair: TradingPair): string {
+  return `${pair}:USDT`;
+}
+
+/**
+ * FuturesExchange インターフェースの実装を生成するファクトリ。
+ *
+ * - kucoinfutures クライアントを使用
+ * - レバレッジ設定を注文前に適用
+ * - ショートポジション（sell）用に設計
+ */
+export function createFuturesExchange(config: EnvConfig, logger: Logger): FuturesExchange {
+  const futures = new ccxt.kucoinfutures({
+    apiKey: config.kucoinApiKey,
+    secret: config.kucoinApiSecret,
+    password: config.kucoinPassphrase,
+  });
+
+  // レバレッジ設定済みペアを追跡（重複API呼び出しを避ける）
+  const leverageSet = new Set<string>();
+
+  async function ensureLeverage(pair: TradingPair): Promise<void> {
+    const symbol = toFuturesSymbol(pair);
+    if (leverageSet.has(symbol)) return;
+
+    try {
+      await withRetry(
+        () => futures.setLeverage(config.futuresLeverage, symbol),
+        logger,
+        `setLeverage(${symbol})`,
+      );
+      leverageSet.add(symbol);
+      logger.info("system", `Futures leverage set to ${String(config.futuresLeverage)}x for ${symbol}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("system", `Failed to set leverage for ${symbol}, may use exchange default`, { error: message });
+    }
+  }
+
+  return {
+    async fetchTicker(
+      pair: TradingPair,
+    ): Promise<{ bid: number; ask: number; last: number }> {
+      const symbol = toFuturesSymbol(pair);
+      const ticker = await withRetry(
+        () => futures.fetchTicker(symbol),
+        logger,
+        `futures.fetchTicker(${symbol})`,
+      );
+      return {
+        bid: ticker.bid ?? 0,
+        ask: ticker.ask ?? 0,
+        last: ticker.last ?? 0,
+      };
+    },
+
+    async createOrder(order: OrderRequest): Promise<OrderResult> {
+      const symbol = toFuturesSymbol(order.pair);
+      return executeOrder({
+        client: futures,
+        order,
+        symbol,
+        config,
+        logger,
+        label: "Futures",
+        extraLogData: { leverage: config.futuresLeverage },
+        preExecute: () => ensureLeverage(order.pair),
+      });
     },
   };
 }

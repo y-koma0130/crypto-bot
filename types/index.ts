@@ -10,6 +10,8 @@ export interface EnvConfig {
   readonly dryRun: boolean;
   readonly env: "test" | "prod";
   readonly totalCapital: number;
+  readonly futuresEnabled: boolean;
+  readonly futuresLeverage: number;
 }
 
 // ── 取引ペア・時間軸 ──
@@ -173,6 +175,21 @@ export interface Exchange {
   fetchBalance(): Promise<{ free: Record<string, number>; total: Record<string, number> }>;
   createOrder(order: OrderRequest): Promise<OrderResult>;
   fetchOrder(orderId: string, pair: TradingPair): Promise<OrderResult>;
+}
+
+/** 先物取引用インターフェース（ショートポジション用） */
+export interface FuturesExchange {
+  createOrder(order: OrderRequest): Promise<OrderResult>;
+  fetchTicker(pair: TradingPair): Promise<{ bid: number; ask: number; last: number }>;
+}
+
+/** ショート（sell）は先物、ロング（buy）はスポットに振り分ける */
+export function getOrderClient(
+  side: OrderSide,
+  exchange: Exchange | FuturesExchange,
+  futuresExchange?: FuturesExchange,
+): Exchange | FuturesExchange {
+  return side === "sell" && futuresExchange ? futuresExchange : exchange;
 }
 
 // ── GPT インターフェース（DI用） ──

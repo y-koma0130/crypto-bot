@@ -14,9 +14,15 @@ export function loadEnvConfig(): EnvConfig {
   const dryRun = process.env["DRY_RUN"] !== "false";
   const env = process.env["ENV"] === "prod" ? "prod" as const : "test" as const;
   const totalCapital = Number(process.env["TOTAL_CAPITAL"] ?? "1000");
+  const futuresEnabled = process.env["FUTURES_ENABLED"] === "true";
+  const futuresLeverage = Number(process.env["FUTURES_LEVERAGE"] ?? "2");
 
   if (Number.isNaN(totalCapital) || totalCapital <= 0) {
     throw new Error("TOTAL_CAPITAL must be a positive number");
+  }
+
+  if (futuresEnabled && (Number.isNaN(futuresLeverage) || futuresLeverage < 1 || futuresLeverage > 20)) {
+    throw new Error("FUTURES_LEVERAGE must be between 1 and 20");
   }
 
   return {
@@ -29,6 +35,8 @@ export function loadEnvConfig(): EnvConfig {
     dryRun,
     env,
     totalCapital,
+    futuresEnabled,
+    futuresLeverage,
   };
 }
 
