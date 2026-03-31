@@ -155,7 +155,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
       // BULLISH: consider opening a buy position
       if (sentiment.level === "BULLISH" && !existingPosition) {
-        if (!canOpenPosition(positions, BOT_NAME, allPositions)) {
+        if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
           logger.debug(BOT_NAME, `Cannot open position for ${pair} — limit reached`);
           continue;
         }

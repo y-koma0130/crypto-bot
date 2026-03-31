@@ -9,13 +9,21 @@ export function calculatePositionSize(params: {
   capitalUsd: number;
   capitalRatio: number;
   price: number;
+  stopDistance?: number;
 }): number {
-  const { capitalUsd, capitalRatio, price } = params;
+  const { capitalUsd, capitalRatio, price, stopDistance } = params;
 
   if (capitalUsd <= 0 || capitalRatio <= 0 || price <= 0) {
     return 0;
   }
 
+  if (stopDistance && stopDistance > 0) {
+    // リスクベース: 1トレードあたりのリスク額 / ストップまでの距離
+    const riskPerTrade = capitalUsd * RISK.RISK_PER_TRADE_PCT;
+    return riskPerTrade / stopDistance;
+  }
+
+  // フォールバック: 従来の固定比率
   return (capitalUsd * capitalRatio) / price;
 }
 
@@ -30,6 +38,7 @@ export function calculatePositionSize(params: {
 export function shouldStopLoss(
   position: Position,
   currentPrice: number,
+  atr?: number,
 ): boolean {
   const { entryPrice, side } = position;
 
@@ -52,19 +61,34 @@ export function shouldStopLoss(
   // トレーリングストップの損切りラインを決定
   let stopPrice: number;
 
-  if (unrealizedPct >= RISK.TRAILING_LOCK_PCT) {
-    // 含み益5%以上: 建値+2%で利益をロック
+  if (atr && atr > 0) {
+    // ATRベース: 最高値/最安値から2×ATR
+    const atrMultiplier = 2;
     stopPrice = side === "buy"
-      ? entryPrice * (1 + RISK.TRAILING_LOCK_STOP_PCT)
-      : entryPrice * (1 - RISK.TRAILING_LOCK_STOP_PCT);
-  } else if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
-    // 含み益3%以上: 建値（ブレークイーブン）に引き上げ
-    stopPrice = entryPrice;
+      ? position.highWaterMark - atr * atrMultiplier
+      : position.highWaterMark + atr * atrMultiplier;
+    // 建値以下にはしない（最低でもブレークイーブン保護）
+    if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
+      const breakevenPrice = side === "buy"
+        ? entryPrice * (1 + RISK.TRADING_FEE_PCT * 2)
+        : entryPrice * (1 - RISK.TRADING_FEE_PCT * 2);
+      stopPrice = side === "buy"
+        ? Math.max(stopPrice, breakevenPrice)
+        : Math.min(stopPrice, breakevenPrice);
+    }
   } else {
-    // 通常の固定損切り
-    stopPrice = side === "buy"
-      ? entryPrice * (1 + RISK.STOP_LOSS_PCT)
-      : entryPrice * (1 - RISK.STOP_LOSS_PCT);
+    // フォールバック: 固定パーセンテージ
+    if (unrealizedPct >= RISK.TRAILING_LOCK_PCT) {
+      stopPrice = side === "buy"
+        ? entryPrice * (1 + RISK.TRAILING_LOCK_STOP_PCT)
+        : entryPrice * (1 - RISK.TRAILING_LOCK_STOP_PCT);
+    } else if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
+      stopPrice = entryPrice;
+    } else {
+      stopPrice = side === "buy"
+        ? entryPrice * (1 + RISK.STOP_LOSS_PCT)
+        : entryPrice * (1 - RISK.STOP_LOSS_PCT);
+    }
   }
 
   // 現在価格が損切りラインを割ったか判定
@@ -131,6 +155,7 @@ export function canOpenPosition(
   currentPositions: readonly Position[],
   botName: BotName,
   allPositions: readonly Position[],
+  side?: "buy" | "sell",
 ): boolean {
   if (currentPositions.length >= RISK.MAX_POSITIONS_PER_BOT) {
     return false;
@@ -138,6 +163,14 @@ export function canOpenPosition(
 
   if (allPositions.length >= RISK.MAX_TOTAL_POSITIONS) {
     return false;
+  }
+
+  // 相関リスク: 同方向のポジションが2つ以上あれば新規エントリーをブロック
+  if (side) {
+    const sameSideCount = allPositions.filter((p) => p.side === side).length;
+    if (sameSideCount >= RISK.MAX_SAME_DIRECTION) {
+      return false;
+    }
   }
 
   return true;

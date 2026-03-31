@@ -1,6 +1,7 @@
 import type {
   Exchange, GPTClient, Logger, OHLCV, Position, TradingPair, BollingerBands, OrderSide, Repository, TradeRecord,
 } from "../types/index.js";
+import type { NewsFetcher } from "../core/news.js";
 import { RANGE_CONFIG, INDICATOR } from "../config/settings.js";
 import {
   calculatePositionSize,
@@ -113,6 +114,95 @@ export function calculateBB(
   };
 }
 
+// ── BB width calculation (pure function) ──
+
+/**
+ * BB幅を計算する（パーセンテージ）。
+ * 幅が狭い = レンジ相場（逆張り有効）、広い = トレンド相場（逆張り危険）。
+ */
+export function calculateBBWidth(bb: BollingerBands): number {
+  if (bb.middle <= 0 || Number.isNaN(bb.middle)) return Infinity;
+  return (bb.upper - bb.lower) / bb.middle;
+}
+
+// ── ADX calculation (pure function) ──
+
+/**
+ * ADX (Average Directional Index) を計算する。
+ * ADX > 25: トレンド相場（逆張り危険）
+ * ADX < 25: レンジ相場（逆張り有効）
+ */
+export function calculateADX(candles: readonly OHLCV[], period: number): number {
+  if (candles.length < period * 2 + 1) return 0;
+
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+  const tr: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const curr = candles[i]!;
+    const prev = candles[i - 1]!;
+
+    const highDiff = curr.high - prev.high;
+    const lowDiff = prev.low - curr.low;
+
+    plusDM.push(highDiff > lowDiff && highDiff > 0 ? highDiff : 0);
+    minusDM.push(lowDiff > highDiff && lowDiff > 0 ? lowDiff : 0);
+
+    const trueRange = Math.max(
+      curr.high - curr.low,
+      Math.abs(curr.high - prev.close),
+      Math.abs(curr.low - prev.close),
+    );
+    tr.push(trueRange);
+  }
+
+  if (tr.length < period) return 0;
+
+  // Wilder's smoothing for ATR, +DM, -DM
+  let atr = 0;
+  let smoothPlusDM = 0;
+  let smoothMinusDM = 0;
+
+  for (let i = 0; i < period; i++) {
+    atr += tr[i]!;
+    smoothPlusDM += plusDM[i]!;
+    smoothMinusDM += minusDM[i]!;
+  }
+  atr /= period;
+  smoothPlusDM /= period;
+  smoothMinusDM /= period;
+
+  const dxValues: number[] = [];
+
+  for (let i = period; i < tr.length; i++) {
+    atr = (atr * (period - 1) + tr[i]!) / period;
+    smoothPlusDM = (smoothPlusDM * (period - 1) + plusDM[i]!) / period;
+    smoothMinusDM = (smoothMinusDM * (period - 1) + minusDM[i]!) / period;
+
+    const plusDI = atr > 0 ? (smoothPlusDM / atr) * 100 : 0;
+    const minusDI = atr > 0 ? (smoothMinusDM / atr) * 100 : 0;
+    const diSum = plusDI + minusDI;
+    const dx = diSum > 0 ? (Math.abs(plusDI - minusDI) / diSum) * 100 : 0;
+    dxValues.push(dx);
+  }
+
+  if (dxValues.length < period) return 0;
+
+  // ADX = SMA of DX for first period, then Wilder's smoothing
+  let adx = 0;
+  for (let i = 0; i < period; i++) {
+    adx += dxValues[i]!;
+  }
+  adx /= period;
+
+  for (let i = period; i < dxValues.length; i++) {
+    adx = (adx * (period - 1) + dxValues[i]!) / period;
+  }
+
+  return adx;
+}
+
 // ── Factory ──
 
 export function createRangeBot(deps: {
@@ -121,8 +211,9 @@ export function createRangeBot(deps: {
   logger: Logger;
   capitalUsd: number;
   repo: Repository;
+  newsFetcher: NewsFetcher;
 }): RangeBot {
-  const { exchange, gpt, logger, capitalUsd, repo } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher } = deps;
   const BOT_NAME = RANGE_CONFIG.name;
 
   /** RSI neutral zone tolerance (±5 around RSI_NEUTRAL) */
@@ -224,7 +315,22 @@ export function createRangeBot(deps: {
     bb: BollingerBands,
     currentPrice: number,
     allPositions: readonly Position[],
+    candles: readonly OHLCV[],
   ): Promise<void> {
+    // BB幅フィルター: バンドが広い（トレンド中）なら逆張りしない
+    const bbWidth = calculateBBWidth(bb);
+    if (bbWidth > INDICATOR.BB_SQUEEZE_THRESHOLD) {
+      logger.debug(BOT_NAME, `BB width too wide for ${pair} (${bbWidth.toFixed(4)}), skipping`, { bbWidth });
+      return;
+    }
+
+    // ADXトレンドフィルター: 強いトレンドが出ている時は逆張りしない
+    const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
+    if (adx > INDICATOR.ADX_TREND_THRESHOLD) {
+      logger.debug(BOT_NAME, `ADX too high for ${pair} (${adx.toFixed(1)}), trend detected, skipping`, { adx });
+      return;
+    }
+
     // Determine signal direction
     let side: OrderSide | null = null;
 
@@ -238,17 +344,18 @@ export function createRangeBot(deps: {
     if (side === null) return;
 
     // Position limit check
-    if (!canOpenPosition(positions, BOT_NAME, allPositions)) {
+    if (!canOpenPosition(positions, BOT_NAME, allPositions, side)) {
       logger.debug(BOT_NAME, `Position limit reached, skipping ${pair}`);
       return;
     }
 
-    // GPT news filter (pass empty news array for now)
+    // GPT news filter
     try {
+      const recentNews = await newsFetcher.fetchNews(pair);
       const filterResult = await gpt.filterNewsSignal(
         pair,
         side.toUpperCase(),
-        [],
+        recentNews,
       );
       logger.info(
         BOT_NAME,
@@ -350,7 +457,7 @@ export function createRangeBot(deps: {
     // RSI/BB の seed 期間 + 安定化バッファ
     const SEED_BUFFER = 20;
     const requiredCandles =
-      Math.max(INDICATOR.BB_PERIOD, INDICATOR.RSI_PERIOD) + SEED_BUFFER;
+      Math.max(INDICATOR.BB_PERIOD, INDICATOR.RSI_PERIOD, INDICATOR.ADX_PERIOD * 2 + 1) + SEED_BUFFER;
 
     let candles: OHLCV[];
     try {
@@ -415,7 +522,7 @@ export function createRangeBot(deps: {
     if (existingPosition) {
       await tryExit(pair, existingPosition, latestRSI, currentPrice);
     } else {
-      await tryEntry(pair, latestRSI, prevRSI, bb, currentPrice, allPositions);
+      await tryEntry(pair, latestRSI, prevRSI, bb, currentPrice, allPositions, candles);
     }
   }
 

@@ -13,6 +13,7 @@ import { MOMENTUM_CONFIG, INDICATOR } from "../config/settings.js";
 import {
   calculatePositionSize,
   calculatePnl,
+  calculateATR,
   shouldStopLoss,
   canOpenPosition,
   isVolatilityExpanding,
@@ -63,6 +64,77 @@ export function calculateEMA(
   }
 
   return ema;
+}
+
+// ── MACD calculation (pure function, exported for testing) ──
+
+export interface MACDResult {
+  readonly macdLine: number;
+  readonly signalLine: number;
+  readonly histogram: number;
+}
+
+/**
+ * MACD(12,26,9) を計算する。
+ * macdLine = EMA(12) - EMA(26)
+ * signalLine = EMA(9) of macdLine
+ * histogram = macdLine - signalLine
+ */
+export function calculateMACD(candles: readonly OHLCV[]): MACDResult {
+  const ema12 = calculateEMA(candles, 12);
+  const ema26 = calculateEMA(candles, 26);
+
+  // MACD line = EMA12 - EMA26
+  const macdValues: number[] = [];
+  for (let i = 0; i < candles.length; i++) {
+    const e12 = ema12[i];
+    const e26 = ema26[i];
+    if (e12 === undefined || e26 === undefined || Number.isNaN(e12) || Number.isNaN(e26)) {
+      macdValues.push(NaN);
+    } else {
+      macdValues.push(e12 - e26);
+    }
+  }
+
+  // Signal line = EMA(9) of MACD values
+  const signalPeriod = 9;
+  const k = 2 / (signalPeriod + 1);
+  const signalValues: number[] = new Array(macdValues.length).fill(NaN) as number[];
+
+  // Find first valid MACD index
+  let firstValid = -1;
+  for (let i = 0; i < macdValues.length; i++) {
+    if (!Number.isNaN(macdValues[i]!)) {
+      if (firstValid === -1) firstValid = i;
+    }
+  }
+
+  if (firstValid === -1 || firstValid + signalPeriod > macdValues.length) {
+    return { macdLine: NaN, signalLine: NaN, histogram: NaN };
+  }
+
+  // Seed with SMA of first signalPeriod valid MACD values
+  let sum = 0;
+  for (let i = firstValid; i < firstValid + signalPeriod; i++) {
+    sum += macdValues[i]!;
+  }
+  signalValues[firstValid + signalPeriod - 1] = sum / signalPeriod;
+
+  for (let i = firstValid + signalPeriod; i < macdValues.length; i++) {
+    const prev = signalValues[i - 1]!;
+    const curr = macdValues[i]!;
+    if (Number.isNaN(prev) || Number.isNaN(curr)) continue;
+    signalValues[i] = curr * k + prev * (1 - k);
+  }
+
+  const lastMacd = macdValues[macdValues.length - 1] ?? NaN;
+  const lastSignal = signalValues[signalValues.length - 1] ?? NaN;
+
+  return {
+    macdLine: lastMacd,
+    signalLine: lastSignal,
+    histogram: Number.isNaN(lastMacd) || Number.isNaN(lastSignal) ? NaN : lastMacd - lastSignal,
+  };
 }
 
 // ── Crossover detection ──
@@ -159,9 +231,10 @@ export function createMomentumBot(deps: {
     position: Position,
     signal: EMASignal,
     currentPrice: number,
+    atr?: number,
   ): Promise<void> {
     // Stop-loss check
-    if (shouldStopLoss(position, currentPrice)) {
+    if (shouldStopLoss(position, currentPrice, atr)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair}`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -236,7 +309,7 @@ export function createMomentumBot(deps: {
     }
 
     // Position limit check
-    if (!canOpenPosition(positions, BOT_NAME, allPositions)) {
+    if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
       logger.info(BOT_NAME, `Position limit reached, skipping ${pair}`);
       return;
     }
@@ -245,6 +318,35 @@ export function createMomentumBot(deps: {
     if (!isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD)) {
       logger.debug(BOT_NAME, `Volatility not expanding for ${pair}, skipping entry`);
       return;
+    }
+
+    // MACD ヒストグラム確認: 正かつ増加中であること
+    const macd = calculateMACD(confirmedCandles);
+    if (Number.isNaN(macd.histogram) || macd.histogram <= 0) {
+      logger.debug(BOT_NAME, `MACD histogram not positive for ${pair}, skipping entry`, {
+        histogram: macd.histogram,
+      });
+      return;
+    }
+
+    // マルチタイムフレーム: 4h足のEMA(50)で上位トレンドを確認
+    try {
+      const candles4h = await exchange.fetchOHLCV(pair, "4h", 55);
+      if (candles4h.length >= 50) {
+        const ema4h = calculateEMA(candles4h, 50);
+        const latestEma4h = ema4h[ema4h.length - 1];
+        const latest4hClose = candles4h[candles4h.length - 1]?.close;
+        if (latestEma4h !== undefined && !Number.isNaN(latestEma4h) && latest4hClose !== undefined && latest4hClose < latestEma4h) {
+          logger.debug(BOT_NAME, `4h price below EMA(50) for ${pair}, skipping entry (counter-trend)`, {
+            price4h: latest4hClose,
+            ema4h50: latestEma4h,
+          });
+          return;
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(BOT_NAME, `Failed to fetch 4h data for ${pair}, proceeding without MTF check`, { error: message });
     }
 
     // GPT market regime classification
@@ -365,10 +467,13 @@ export function createMomentumBot(deps: {
       currentPrice,
     });
 
+    // ATRを計算（トレーリングストップ用）
+    const atr = calculateATR(candles, INDICATOR.ATR_PERIOD);
+
     const existingPosition = findPosition(pair);
 
     if (existingPosition) {
-      await tryExit(pair, existingPosition, signal, currentPrice);
+      await tryExit(pair, existingPosition, signal, currentPrice, atr);
     } else {
       await tryEntry(pair, signal, candles, allPositions);
     }

@@ -67,6 +67,7 @@ async function main(): Promise<void> {
     logger,
     capitalUsd: config.totalCapital,
     repo,
+    newsFetcher,
   });
 
   // ── 起動時ヘルスチェック ──
