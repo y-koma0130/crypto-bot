@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "ENV_FILE=.env.test tsx main.ts",
+    "start": "tsx main.ts",
     "start:prod": "ENV_FILE=.env.prod tsx main.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -20,16 +21,16 @@
     "node-cron": "^3.0.3",
     "openai": "^4.70.0",
     "postgres": "^3.4.8",
-    "rss-parser": "^3.13.0"
+    "rss-parser": "^3.13.0",
+    "tsx": "^4.19.0"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
     "@types/node-cron": "^3.0.11",
     "drizzle-kit": "^0.31.10",
-    "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=20"
   }
 }
