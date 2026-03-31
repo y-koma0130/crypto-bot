@@ -15,6 +15,7 @@ import {
   calculatePnl,
   shouldStopLoss,
   canOpenPosition,
+  isVolatilityExpanding,
 } from "../core/risk.js";
 
 // ── EMA calculation (pure function, exported for testing) ──
@@ -240,6 +241,12 @@ export function createMomentumBot(deps: {
       return;
     }
 
+    // ATR ボラティリティフィルター: ボラが拡大していない場合はスキップ
+    if (!isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD)) {
+      logger.debug(BOT_NAME, `Volatility not expanding for ${pair}, skipping entry`);
+      return;
+    }
+
     // GPT market regime classification
     try {
       const regime = await gpt.classifyMarketRegime(pair, [...confirmedCandles]);
@@ -294,6 +301,7 @@ export function createMomentumBot(deps: {
         entryPrice: result.price,
         amount: result.amount,
         openedAt: result.timestamp,
+        highWaterMark: result.price,
       };
       positions.push(newPosition);
 
@@ -396,6 +404,7 @@ export function createMomentumBot(deps: {
           entryPrice: trade.entry_price,
           amount: trade.amount,
           openedAt: trade.created_at ? new Date(trade.created_at).getTime() : Date.now(),
+          highWaterMark: trade.entry_price,
         });
         if (trade.id) {
           tradeIds.set(trade.symbol, trade.id);

@@ -220,6 +220,7 @@ export function createRangeBot(deps: {
   async function tryEntry(
     pair: TradingPair,
     rsiValue: number,
+    prevRsi: number,
     bb: BollingerBands,
     currentPrice: number,
     allPositions: readonly Position[],
@@ -227,9 +228,10 @@ export function createRangeBot(deps: {
     // Determine signal direction
     let side: OrderSide | null = null;
 
-    if (rsiValue < INDICATOR.RSI_OVERSOLD && currentPrice < bb.lower) {
+    // RSI反転確認: 前回がオーバーソールド/オーバーボートで、今回が反転方向
+    if (prevRsi < INDICATOR.RSI_OVERSOLD && rsiValue > prevRsi && currentPrice < bb.lower) {
       side = "buy";
-    } else if (rsiValue > INDICATOR.RSI_OVERBOUGHT && currentPrice > bb.upper) {
+    } else if (prevRsi > INDICATOR.RSI_OVERBOUGHT && rsiValue < prevRsi && currentPrice > bb.upper) {
       side = "sell";
     }
 
@@ -322,6 +324,7 @@ export function createRangeBot(deps: {
       entryPrice: fillPrice,
       amount,
       openedAt: Date.now(),
+      highWaterMark: fillPrice,
     });
 
     // Record trade in DB
@@ -381,8 +384,15 @@ export function createRangeBot(deps: {
     const latestRSI = rsiSeries[rsiSeries.length - 1];
     const currentPrice = candles[candles.length - 1]!.close;
 
+    const prevRSI = rsiSeries[rsiSeries.length - 2];
+
     if (latestRSI === undefined || Number.isNaN(latestRSI)) {
       logger.warn(BOT_NAME, `RSI not available for ${pair}`);
+      return;
+    }
+
+    if (prevRSI === undefined || Number.isNaN(prevRSI)) {
+      logger.warn(BOT_NAME, `Previous RSI not available for ${pair}`);
       return;
     }
 
@@ -393,6 +403,7 @@ export function createRangeBot(deps: {
 
     logger.debug(BOT_NAME, `Indicators for ${pair}`, {
       rsi: latestRSI,
+      prevRsi: prevRSI,
       bbUpper: bb.upper,
       bbMiddle: bb.middle,
       bbLower: bb.lower,
@@ -404,7 +415,7 @@ export function createRangeBot(deps: {
     if (existingPosition) {
       await tryExit(pair, existingPosition, latestRSI, currentPrice);
     } else {
-      await tryEntry(pair, latestRSI, bb, currentPrice, allPositions);
+      await tryEntry(pair, latestRSI, prevRSI, bb, currentPrice, allPositions);
     }
   }
 
@@ -438,6 +449,7 @@ export function createRangeBot(deps: {
           entryPrice: trade.entry_price,
           amount: trade.amount,
           openedAt: trade.created_at ? new Date(trade.created_at).getTime() : Date.now(),
+          highWaterMark: trade.entry_price,
         });
         if (trade.id) {
           tradeIds.set(trade.symbol, trade.id);

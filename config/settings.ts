@@ -78,6 +78,14 @@ export const RISK = {
   TRADING_FEE_PCT: 0.001,
   /** スリッページ許容（0.5%） */
   SLIPPAGE_TOLERANCE_PCT: 0.005,
+  /** トレーリングストップ: 損切りラインを建値に移動する閾値 */
+  TRAILING_BREAKEVEN_PCT: 0.03,
+  /** トレーリングストップ: 損切りラインを引き上げる閾値 */
+  TRAILING_LOCK_PCT: 0.05,
+  /** トレーリングストップ: 引き上げ後の損切りライン（建値からの%） */
+  TRAILING_LOCK_STOP_PCT: 0.02,
+  /** ATR フィルター: ATRが平均の何倍以上でトレンドとみなすか */
+  ATR_TREND_MULTIPLIER: 1.2,
 } as const;
 
 // ── テクニカル指標パラメータ ──
@@ -93,4 +101,5 @@ export const INDICATOR = {
   RSI_NEUTRAL: 50,
   BB_PERIOD: 20,
   BB_STD_DEV: 2,
+  ATR_PERIOD: 14,
 } as const;

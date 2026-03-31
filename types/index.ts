@@ -57,6 +57,8 @@ export interface Position {
   readonly entryPrice: number;
   readonly amount: number;
   readonly openedAt: number;
+  /** トレーリングストップ用: ポジション保有中の最高/最低到達価格 */
+  highWaterMark: number;
 }
 
 // ── ボット ──

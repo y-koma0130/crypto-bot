@@ -2,6 +2,7 @@ import type {
   Exchange, GPTClient, Logger, Position, SentimentResult, TradingPair, Repository, TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
+import { calculateEMA } from "./momentum.js";
 import { SENTIMENT_CONFIG } from "../config/settings.js";
 import {
   calculatePositionSize,
@@ -173,6 +174,23 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
             continue;
           }
 
+          // テクニカル確認: 価格がEMA(20)の上にある場合のみエントリー
+          try {
+            const candles = await exchange.fetchOHLCV(pair, SENTIMENT_CONFIG.timeframe, 25);
+            if (candles.length >= 20) {
+              const ema = calculateEMA(candles, 20);
+              const latestEma = ema[ema.length - 1];
+              if (latestEma !== undefined && !Number.isNaN(latestEma) && price < latestEma) {
+                logger.debug(BOT_NAME, `Price below EMA(20) for ${pair}, skipping entry`);
+                continue;
+              }
+            }
+          } catch {
+            // テクニカルデータ取得失敗時はスキップ（安全側に倒す）
+            logger.debug(BOT_NAME, `Failed to fetch technical data for ${pair}, skipping entry`);
+            continue;
+          }
+
           await openPosition(pair, amount);
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
@@ -220,6 +238,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
       entryPrice: result.price,
       amount: result.amount,
       openedAt: Date.now(),
+      highWaterMark: result.price,
     });
 
     // Record trade in DB
@@ -275,6 +294,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
           entryPrice: trade.entry_price,
           amount: trade.amount,
           openedAt: trade.created_at ? new Date(trade.created_at).getTime() : Date.now(),
+          highWaterMark: trade.entry_price,
         });
         if (trade.id) {
           tradeIds.set(trade.symbol, trade.id);

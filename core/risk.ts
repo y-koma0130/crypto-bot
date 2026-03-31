@@ -1,4 +1,4 @@
-import type { BotName, Position } from "../types/index.js";
+import type { BotName, OHLCV, Position } from "../types/index.js";
 import { RISK } from "../config/settings.js";
 
 /**
@@ -20,24 +20,106 @@ export function calculatePositionSize(params: {
 }
 
 /**
- * 損切りラインに達しているか判定する。
- * buy ポジション: 価格が entryPrice から STOP_LOSS_PCT 以上下落したら true
- * sell ポジション: 価格が entryPrice から STOP_LOSS_PCT 以上上昇したら true
+ * トレーリングストップを考慮した損切り判定。
+ *
+ * 1. highWaterMark を更新（buy: 最高値、sell: 最安値）
+ * 2. 含み益が TRAILING_BREAKEVEN_PCT 以上 → 損切りラインを建値に引き上げ
+ * 3. 含み益が TRAILING_LOCK_PCT 以上 → 損切りラインを建値+TRAILING_LOCK_STOP_PCT に引き上げ
+ * 4. 引き上げ後の損切りラインと固定損切り(-5%)のうち、有利な方で判定
  */
 export function shouldStopLoss(
   position: Position,
   currentPrice: number,
 ): boolean {
-  if (position.side === "buy") {
-    const pctChange =
-      (currentPrice - position.entryPrice) / position.entryPrice;
-    return pctChange < RISK.STOP_LOSS_PCT;
+  const { entryPrice, side } = position;
+
+  // highWaterMark を更新（mutable: Position.highWaterMark は書き換え可能）
+  if (side === "buy") {
+    if (currentPrice > position.highWaterMark) {
+      position.highWaterMark = currentPrice;
+    }
+  } else {
+    if (currentPrice < position.highWaterMark) {
+      position.highWaterMark = currentPrice;
+    }
   }
 
-  // sell ポジション: 価格上昇が損失
-  const pctChange =
-    (position.entryPrice - currentPrice) / position.entryPrice;
-  return pctChange < RISK.STOP_LOSS_PCT;
+  // 含み益率を計算
+  const unrealizedPct = side === "buy"
+    ? (position.highWaterMark - entryPrice) / entryPrice
+    : (entryPrice - position.highWaterMark) / entryPrice;
+
+  // トレーリングストップの損切りラインを決定
+  let stopPrice: number;
+
+  if (unrealizedPct >= RISK.TRAILING_LOCK_PCT) {
+    // 含み益5%以上: 建値+2%で利益をロック
+    stopPrice = side === "buy"
+      ? entryPrice * (1 + RISK.TRAILING_LOCK_STOP_PCT)
+      : entryPrice * (1 - RISK.TRAILING_LOCK_STOP_PCT);
+  } else if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
+    // 含み益3%以上: 建値（ブレークイーブン）に引き上げ
+    stopPrice = entryPrice;
+  } else {
+    // 通常の固定損切り
+    stopPrice = side === "buy"
+      ? entryPrice * (1 + RISK.STOP_LOSS_PCT)
+      : entryPrice * (1 - RISK.STOP_LOSS_PCT);
+  }
+
+  // 現在価格が損切りラインを割ったか判定
+  return side === "buy" ? currentPrice <= stopPrice : currentPrice >= stopPrice;
+}
+
+/**
+ * ATR (Average True Range) を計算する。
+ * ボラティリティの指標として、トレンド発生の判定に使用。
+ */
+export function calculateATR(candles: readonly OHLCV[], period: number): number {
+  if (candles.length < period + 1) return 0;
+
+  const trueRanges: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    const curr = candles[i]!;
+    const prev = candles[i - 1]!;
+    const tr = Math.max(
+      curr.high - curr.low,
+      Math.abs(curr.high - prev.close),
+      Math.abs(curr.low - prev.close),
+    );
+    trueRanges.push(tr);
+  }
+
+  // 最初のATRはSMAで算出
+  let atr = 0;
+  for (let i = 0; i < period; i++) {
+    atr += trueRanges[i]!;
+  }
+  atr /= period;
+
+  // 以降はWilder's smoothing
+  for (let i = period; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]!) / period;
+  }
+
+  return atr;
+}
+
+/**
+ * ATR が直近平均に比べて十分高いか判定する。
+ * 高い → ボラティリティ拡大 → トレンド発生の可能性。
+ */
+export function isVolatilityExpanding(candles: readonly OHLCV[], period: number): boolean {
+  if (candles.length < period * 2 + 1) return false;
+
+  const recentCandles = candles.slice(-period - 1);
+  const olderCandles = candles.slice(-(period * 2 + 1), -period);
+
+  const recentATR = calculateATR(recentCandles, period);
+  const olderATR = calculateATR(olderCandles, period);
+
+  if (olderATR <= 0) return false;
+  return recentATR / olderATR >= RISK.ATR_TREND_MULTIPLIER;
 }
 
 /**
