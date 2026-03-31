@@ -1,5 +1,5 @@
 import { drizzle } from "drizzle-orm/postgres-js";
-import { eq, and, desc, gte } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import postgres from "postgres";
 import { trades, signals, botStatus } from "../db/schema.js";
 import type {
@@ -144,22 +144,19 @@ export function createRepository(config: EnvConfig, logger: Logger): Repository 
 
     async getDailyPnl(): Promise<number> {
       try {
+        const rows = await db
+          .select({ pnl: trades.pnl, closedAt: trades.closedAt })
+          .from(trades)
+          .where(eq(trades.status, "closed"));
+
         const todayStart = new Date();
         todayStart.setHours(0, 0, 0, 0);
 
-        const rows = await db
-          .select({ pnl: trades.pnl })
-          .from(trades)
-          .where(
-            and(
-              eq(trades.status, "closed"),
-              gte(trades.closedAt, todayStart),
-            ),
-          );
-
         let total = 0;
         for (const row of rows) {
-          if (row.pnl != null) total += Number(row.pnl);
+          if (row.pnl != null && row.closedAt && row.closedAt >= todayStart) {
+            total += Number(row.pnl);
+          }
         }
         return total;
       } catch (err: unknown) {
