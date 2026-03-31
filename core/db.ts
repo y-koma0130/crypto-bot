@@ -36,7 +36,12 @@ function toTradeRecord(row: TradeRow): TradeRecord {
 }
 
 export function createRepository(config: EnvConfig, logger: Logger): Repository {
-  const client = postgres(config.databaseUrl, { max: 10, idle_timeout: 30, ssl: "require" });
+  const client = postgres(config.databaseUrl, {
+    max: 10,
+    idle_timeout: 30,
+    ssl: { rejectUnauthorized: false },
+    prepare: false,
+  });
   const db = drizzle(client);
 
   return {
