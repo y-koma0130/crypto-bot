@@ -308,6 +308,9 @@ export function createRangeBot(deps: {
 
   // ── Entry logic ──
 
+  /** 参考指標の必要通過数 */
+  const REQUIRED_SUPPLEMENTARY = 2;
+
   async function tryEntry(
     pair: TradingPair,
     rsiValue: number,
@@ -317,39 +320,37 @@ export function createRangeBot(deps: {
     allPositions: readonly Position[],
     candles: readonly OHLCV[],
   ): Promise<void> {
-    // BB幅フィルター: バンドが広い（トレンド中）なら逆張りしない
-    const bbWidth = calculateBBWidth(bb);
-    if (bbWidth > INDICATOR.BB_SQUEEZE_THRESHOLD) {
-      logger.debug(BOT_NAME, `BB width too wide for ${pair} (${bbWidth.toFixed(4)}), skipping`, { bbWidth });
-      return;
-    }
+    // ── コア条件（全て必須） ──
 
-    // ADXトレンドフィルター: 強いトレンドが出ている時は逆張りしない
-    const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
-    if (adx > INDICATOR.ADX_TREND_THRESHOLD) {
-      logger.debug(BOT_NAME, `ADX too high for ${pair} (${adx.toFixed(1)}), trend detected, skipping`, { adx });
-      return;
-    }
-
-    // Determine signal direction
+    // 1. RSI反転確認 + BB外側（レンジ逆張りの根幹）
     let side: OrderSide | null = null;
-
-    // RSI反転確認: 前回がオーバーソールド/オーバーボートで、今回が反転方向
     if (prevRsi < INDICATOR.RSI_OVERSOLD && rsiValue > prevRsi && currentPrice < bb.lower) {
       side = "buy";
     } else if (prevRsi > INDICATOR.RSI_OVERBOUGHT && rsiValue < prevRsi && currentPrice > bb.upper) {
       side = "sell";
     }
-
     if (side === null) return;
 
-    // Position limit check
+    // 2. ポジション制限（リスク管理）
     if (!canOpenPosition(positions, BOT_NAME, allPositions, side)) {
       logger.debug(BOT_NAME, `Position limit reached, skipping ${pair}`);
       return;
     }
 
-    // GPT news filter
+    // ── 参考指標（3つ中2つ以上で実行） ──
+
+    const supplementary: { name: string; passed: boolean }[] = [];
+
+    // S1. BB幅フィルター（スクイーズ確認）
+    const bbWidth = calculateBBWidth(bb);
+    supplementary.push({ name: "bb_squeeze", passed: bbWidth <= INDICATOR.BB_SQUEEZE_THRESHOLD });
+
+    // S2. ADXトレンドフィルター
+    const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
+    supplementary.push({ name: "adx_range", passed: adx <= INDICATOR.ADX_TREND_THRESHOLD });
+
+    // S3. GPTニュースフィルター
+    let gptOk = false;
     try {
       const recentNews = await newsFetcher.fetchNews(pair);
       const filterResult = await gpt.filterNewsSignal(
@@ -374,19 +375,25 @@ export function createRangeBot(deps: {
         logger.error(BOT_NAME, "Failed to record signal", { error: msg });
       });
 
-      if (!filterResult.safe) {
-        logger.info(
-          BOT_NAME,
-          `Skipping entry on ${pair} — GPT filtered as unsafe`,
-        );
-        return;
-      }
+      gptOk = filterResult.safe;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `GPT news filter failed for ${pair}, proceeding with technical signals only`, {
-        error: message,
-      });
-      // Fallback: テクニカル条件が全て通過済みなのでGPTなしで続行
+      logger.warn(BOT_NAME, `GPT news filter failed for ${pair}`, { error: message });
+    }
+    supplementary.push({ name: "gpt_news", passed: gptOk });
+
+    const passedCount = supplementary.filter((s) => s.passed).length;
+    const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
+    const failedNames = supplementary.filter((s) => !s.passed).map((s) => s.name);
+
+    logger.info(BOT_NAME, `Supplementary signals for ${pair}: ${String(passedCount)}/${String(supplementary.length)}`, {
+      passed: passedNames,
+      failed: failedNames,
+    });
+
+    if (passedCount < REQUIRED_SUPPLEMENTARY) {
+      logger.info(BOT_NAME, `Insufficient supplementary signals for ${pair} (${String(passedCount)}/${String(REQUIRED_SUPPLEMENTARY)} required), skipping`);
+      return;
     }
 
     // Calculate position size

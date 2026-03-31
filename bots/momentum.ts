@@ -293,34 +293,21 @@ export function createMomentumBot(deps: {
 
   // ── Entry logic ──
 
+  /** 参考指標の必要通過数 */
+  const REQUIRED_SUPPLEMENTARY = 2;
+
   async function tryEntry(
     pair: TradingPair,
     signal: EMASignal,
     confirmedCandles: readonly OHLCV[],
     allPositions: readonly Position[],
   ): Promise<void> {
-    // Must have crossover
+    // ── コア条件（全て必須） ──
+
+    // 1. EMAクロスオーバー（モメンタム戦略の根幹）
     if (!signal.crossOver) return;
 
-    // Volume confirmation
-    if (!isVolumeConfirmed(confirmedCandles)) {
-      logger.debug(BOT_NAME, `Volume not confirmed for ${pair}, skipping`);
-      return;
-    }
-
-    // Position limit check
-    if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
-      logger.info(BOT_NAME, `Position limit reached, skipping ${pair}`);
-      return;
-    }
-
-    // ATR ボラティリティフィルター: ボラが拡大していない場合はスキップ
-    if (!isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD)) {
-      logger.debug(BOT_NAME, `Volatility not expanding for ${pair}, skipping entry`);
-      return;
-    }
-
-    // MACD ヒストグラム確認: 正かつ増加中であること
+    // 2. MACDヒストグラム > 0（モメンタム方向の確認）
     const macd = calculateMACD(confirmedCandles);
     if (Number.isNaN(macd.histogram) || macd.histogram <= 0) {
       logger.debug(BOT_NAME, `MACD histogram not positive for ${pair}, skipping entry`, {
@@ -329,47 +316,69 @@ export function createMomentumBot(deps: {
       return;
     }
 
-    // マルチタイムフレーム: 4h足のEMA(50)で上位トレンドを確認
+    // 3. ポジション制限（リスク管理）
+    if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
+      logger.info(BOT_NAME, `Position limit reached, skipping ${pair}`);
+      return;
+    }
+
+    // ── 参考指標（4つ中2つ以上で実行） ──
+
+    const supplementary: { name: string; passed: boolean }[] = [];
+
+    // S1. 出来高確認
+    const volumeOk = isVolumeConfirmed(confirmedCandles);
+    supplementary.push({ name: "volume", passed: volumeOk });
+
+    // S2. ATRボラティリティ拡大
+    const atrOk = isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD);
+    supplementary.push({ name: "atr", passed: atrOk });
+
+    // S3. 4h EMA(50) 上位トレンド確認
+    let mtfOk = false;
     try {
       const candles4h = await exchange.fetchOHLCV(pair, "4h", 55);
       if (candles4h.length >= 50) {
         const ema4h = calculateEMA(candles4h, 50);
         const latestEma4h = ema4h[ema4h.length - 1];
         const latest4hClose = candles4h[candles4h.length - 1]?.close;
-        if (latestEma4h !== undefined && !Number.isNaN(latestEma4h) && latest4hClose !== undefined && latest4hClose < latestEma4h) {
-          logger.debug(BOT_NAME, `4h price below EMA(50) for ${pair}, skipping entry (counter-trend)`, {
-            price4h: latest4hClose,
-            ema4h50: latestEma4h,
-          });
-          return;
+        if (latestEma4h !== undefined && !Number.isNaN(latestEma4h) && latest4hClose !== undefined) {
+          mtfOk = latest4hClose >= latestEma4h;
         }
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `Failed to fetch 4h data for ${pair}, proceeding without MTF check`, { error: message });
+      logger.warn(BOT_NAME, `Failed to fetch 4h data for ${pair}`, { error: message });
     }
+    supplementary.push({ name: "mtf_4h", passed: mtfOk });
 
-    // GPT market regime classification
+    // S4. GPTレジーム判定
+    let gptOk = false;
     try {
       const regime = await gpt.classifyMarketRegime(pair, [...confirmedCandles]);
       logger.info(BOT_NAME, `GPT regime for ${pair}: ${regime.regime}`, {
         confidence: regime.confidence,
         reasoning: regime.reasoning,
       });
-
-      if (regime.regime === "RANGING") {
-        logger.info(
-          BOT_NAME,
-          `Skipping entry on ${pair} — GPT classified as RANGING`,
-        );
-        return;
-      }
+      gptOk = regime.regime !== "RANGING";
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `GPT regime check failed for ${pair}, proceeding with technical signals only`, {
-        error: message,
-      });
-      // Fallback: テクニカル条件が全て通過済みなのでGPTなしで続行
+      logger.warn(BOT_NAME, `GPT regime check failed for ${pair}`, { error: message });
+    }
+    supplementary.push({ name: "gpt_regime", passed: gptOk });
+
+    const passedCount = supplementary.filter((s) => s.passed).length;
+    const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
+    const failedNames = supplementary.filter((s) => !s.passed).map((s) => s.name);
+
+    logger.info(BOT_NAME, `Supplementary signals for ${pair}: ${String(passedCount)}/${String(supplementary.length)}`, {
+      passed: passedNames,
+      failed: failedNames,
+    });
+
+    if (passedCount < REQUIRED_SUPPLEMENTARY) {
+      logger.info(BOT_NAME, `Insufficient supplementary signals for ${pair} (${String(passedCount)}/${String(REQUIRED_SUPPLEMENTARY)} required), skipping`);
+      return;
     }
 
     // Fetch current price from ticker (use ask for buy orders)
