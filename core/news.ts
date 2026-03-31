@@ -25,7 +25,9 @@ export interface NewsFetcher {
 }
 
 export function createNewsFetcher(logger: Logger): NewsFetcher {
-  const parser = new RSSParser();
+  const parser = new RSSParser({
+    timeout: 15_000,
+  });
 
   // フィードのキャッシュ（全ペア共通、tick毎に1回だけフェッチ）
   let cachedArticles: { title: string; pubDate: number }[] = [];
@@ -65,14 +67,14 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
 
     cachedArticles = articles;
     lastFetchedAt = now;
-    logger.debug("system", `RSS cache refreshed: ${articles.length} articles`);
+    logger.info("system", `RSS cache refreshed: ${articles.length} articles from ${RSS_FEEDS.length} feeds`);
   }
 
   function filterByPair(pair: TradingPair): string[] {
     const now = Date.now();
     const keywords = PAIR_KEYWORDS[pair];
 
-    return cachedArticles
+    const filtered = cachedArticles
       .filter((article) => {
         if (now - article.pubDate > MAX_AGE_MS) return false;
 
@@ -81,8 +83,14 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
         const matchesGlobal = GLOBAL_KEYWORDS.some((kw) => titleLower.includes(kw));
         return matchesPair || matchesGlobal;
       })
-      .slice(0, 10) // GPTに渡す量を制限
+      .slice(0, 10)
       .map((article) => article.title);
+
+    logger.debug("system", `News filter for ${pair}: ${filtered.length} articles matched`, {
+      keywords: [...keywords, ...GLOBAL_KEYWORDS],
+    });
+
+    return filtered;
   }
 
   return {
