@@ -1,7 +1,7 @@
 import type { OHLCV, Position, Logger } from "../types/index.js";
 import type { BacktestConfig, BacktestResult, BacktestTrade } from "./types.js";
 import type { MockExchange } from "./mock-exchange.js";
-import { createMockExchange } from "./mock-exchange.js";
+import { createMockExchange, createMockFuturesExchange } from "./mock-exchange.js";
 import { createMockGPTClient } from "./mock-gpt.js";
 import { createMockRepository } from "./mock-repository.js";
 import { createMockNewsFetcher } from "./mock-news.js";
@@ -22,6 +22,7 @@ type BotFactory = (deps: {
   capitalUsd: number;
   repo: ReturnType<typeof createMockRepository>;
   newsFetcher: ReturnType<typeof createMockNewsFetcher>;
+  futuresExchange: ReturnType<typeof createMockFuturesExchange>;
 }) => BacktestableBot;
 
 /**
@@ -36,10 +37,12 @@ export async function runBacktest(
   candles: readonly OHLCV[],
 ): Promise<BacktestResult> {
   const logger = createLogger();
-  const mockExchange = createMockExchange(candles, config.initialCapital);
+  const mockExchange = createMockExchange(candles, config.initialCapital, config.pair);
   const mockGpt = createMockGPTClient();
   const mockRepo = createMockRepository();
   const mockNewsFetcher = createMockNewsFetcher();
+
+  const mockFutures = createMockFuturesExchange(mockExchange);
 
   const bot = botFactory({
     exchange: mockExchange,
@@ -48,6 +51,7 @@ export async function runBacktest(
     capitalUsd: config.initialCapital,
     repo: mockRepo,
     newsFetcher: mockNewsFetcher,
+    futuresExchange: mockFutures,
   });
 
   // Track completed trades

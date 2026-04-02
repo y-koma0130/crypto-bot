@@ -128,6 +128,6 @@ export const INDICATOR = {
   /** ADXがこれ以上ならトレンド相場 */
   ADX_TREND_THRESHOLD: 25,
   /** 短期モメンタム用 EMA */
-  FAST_EMA_SHORT_PERIOD: 5,
-  FAST_EMA_LONG_PERIOD: 13,
+  FAST_EMA_SHORT_PERIOD: 9,
+  FAST_EMA_LONG_PERIOD: 21,
 } as const;

@@ -1,20 +1,23 @@
 import dotenv from "dotenv";
-import type { TradingPair, Timeframe, Position } from "../types/index.js";
+import type { TradingPair, Timeframe } from "../types/index.js";
 import type { BacktestConfig, BacktestResult } from "./types.js";
 import { runBacktest } from "./runner.js";
 import { fetchHistoricalData } from "./data-fetcher.js";
 import { createExchange } from "../core/exchange.js";
 import { createLogger } from "../core/logger.js";
-import { MOMENTUM_CONFIG, RANGE_CONFIG } from "../config/settings.js";
+import { MOMENTUM_CONFIG, MOMENTUM_FAST_CONFIG, RANGE_CONFIG } from "../config/settings.js";
 import { createMomentumBot } from "../bots/momentum.js";
+import { createMomentumFastBot } from "../bots/momentum-fast.js";
 import { createRangeBot } from "../bots/range.js";
-import type { MockExchange } from "./mock-exchange.js";
+import { createMockFuturesExchange, type MockExchange } from "./mock-exchange.js";
 import type { NewsFetcher } from "../core/news.js";
 
 // ── CLI argument parsing ──
 
+type BacktestBot = "momentum" | "momentum-fast" | "range";
+
 interface CliArgs {
-  bot: "momentum" | "range";
+  bot: BacktestBot;
   pair: TradingPair;
   days: number;
 }
@@ -22,7 +25,7 @@ interface CliArgs {
 function parseArgs(): CliArgs {
   const args = process.argv.slice(2);
 
-  let bot: "momentum" | "range" = "momentum";
+  let bot: BacktestBot = "momentum";
   let pair: TradingPair = "BTC/USDT";
   let days = 90;
 
@@ -31,8 +34,8 @@ function parseArgs(): CliArgs {
     const next = args[i + 1];
 
     if (arg === "--bot" && next !== undefined) {
-      if (next !== "momentum" && next !== "range") {
-        console.error(`Invalid bot: ${next}. Must be "momentum" or "range".`);
+      if (next !== "momentum" && next !== "momentum-fast" && next !== "range") {
+        console.error(`Invalid bot: ${next}. Must be "momentum", "momentum-fast", or "range".`);
         process.exit(1);
       }
       bot = next;
@@ -125,7 +128,12 @@ async function main(): Promise<void> {
   console.log(`\nBacktest: bot=${cliArgs.bot} pair=${cliArgs.pair} days=${cliArgs.days}\n`);
 
   // Determine timeframe from bot config
-  const botConfig = cliArgs.bot === "momentum" ? MOMENTUM_CONFIG : RANGE_CONFIG;
+  const botConfigMap = {
+    momentum: MOMENTUM_CONFIG,
+    "momentum-fast": MOMENTUM_FAST_CONFIG,
+    range: RANGE_CONFIG,
+  } as const;
+  const botConfig = botConfigMap[cliArgs.bot];
   const timeframe: Timeframe = botConfig.timeframe;
 
   // Date range
@@ -173,39 +181,40 @@ async function main(): Promise<void> {
   };
 
   // Create bot factory based on selected bot type
-  const botFactory =
-    cliArgs.bot === "momentum"
-      ? (deps: {
-          exchange: MockExchange;
-          gpt: Parameters<typeof createMomentumBot>[0]["gpt"];
-          logger: Parameters<typeof createMomentumBot>[0]["logger"];
-          capitalUsd: number;
-          repo: Parameters<typeof createMomentumBot>[0]["repo"];
-          newsFetcher: NewsFetcher;
-        }) =>
-          createMomentumBot({
-            exchange: deps.exchange,
-            gpt: deps.gpt,
-            logger: deps.logger,
-            capitalUsd: deps.capitalUsd,
-            repo: deps.repo,
-          })
-      : (deps: {
-          exchange: MockExchange;
-          gpt: Parameters<typeof createRangeBot>[0]["gpt"];
-          logger: Parameters<typeof createRangeBot>[0]["logger"];
-          capitalUsd: number;
-          repo: Parameters<typeof createRangeBot>[0]["repo"];
-          newsFetcher: NewsFetcher;
-        }) =>
-          createRangeBot({
-            exchange: deps.exchange,
-            gpt: deps.gpt,
-            logger: deps.logger,
-            capitalUsd: deps.capitalUsd,
-            repo: deps.repo,
-            newsFetcher: deps.newsFetcher,
-          });
+  type BotDeps = {
+    exchange: MockExchange;
+    gpt: Parameters<typeof createMomentumBot>[0]["gpt"];
+    logger: Parameters<typeof createMomentumBot>[0]["logger"];
+    capitalUsd: number;
+    repo: Parameters<typeof createMomentumBot>[0]["repo"];
+    newsFetcher: NewsFetcher;
+    futuresExchange: ReturnType<typeof createMockFuturesExchange>;
+  };
+
+  function createBotFactory(botType: BacktestBot) {
+    switch (botType) {
+      case "momentum":
+        return (deps: BotDeps) => createMomentumBot({
+          exchange: deps.exchange, gpt: deps.gpt, logger: deps.logger,
+          capitalUsd: deps.capitalUsd, repo: deps.repo,
+          futuresExchange: deps.futuresExchange,
+        });
+      case "momentum-fast":
+        return (deps: BotDeps) => createMomentumFastBot({
+          exchange: deps.exchange, gpt: deps.gpt, logger: deps.logger,
+          capitalUsd: deps.capitalUsd, repo: deps.repo,
+          futuresExchange: deps.futuresExchange,
+        });
+      case "range":
+        return (deps: BotDeps) => createRangeBot({
+          exchange: deps.exchange, gpt: deps.gpt, logger: deps.logger,
+          capitalUsd: deps.capitalUsd, repo: deps.repo, newsFetcher: deps.newsFetcher,
+          futuresExchange: deps.futuresExchange,
+        });
+    }
+  }
+
+  const botFactory = createBotFactory(cliArgs.bot);
 
   // Run backtest
   const result = await runBacktest(config, botFactory, candles);

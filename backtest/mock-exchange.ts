@@ -27,6 +27,7 @@ export interface MockExchange extends Exchange {
 export function createMockExchange(
   candles: readonly OHLCV[],
   initialCapital: number,
+  targetPair?: TradingPair,
 ): MockExchange {
   let currentIndex = 0;
   let orderCounter = 0;
@@ -60,13 +61,13 @@ export function createMockExchange(
     },
 
     async fetchOHLCV(
-      _pair: TradingPair,
+      pair: TradingPair,
       _timeframe: Timeframe,
       limit: number,
     ): Promise<OHLCV[]> {
-      // Return up to `limit` candles ending at currentIndex (inclusive).
-      // Unlike the real exchange, we do NOT drop the last candle because
-      // historical data is already confirmed.
+      // バックテスト対象ペア以外にはデータを返さない（重複トレード防止）
+      if (targetPair && pair !== targetPair) return [];
+
       const start = Math.max(0, currentIndex - limit + 1);
       const end = currentIndex + 1;
       return candles.slice(start, end);
