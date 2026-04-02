@@ -14,7 +14,7 @@ import {
   type OrderSide,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
-import { POLYMARKET_BOT_CONFIG, RISK } from "../config/settings.js";
+import { POLYMARKET_BOT_CONFIG } from "../config/settings.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -95,14 +95,14 @@ export function createPolymarketBot(deps: {
     if (existing) {
       try {
         const ticker = await exchange.fetchTicker(pair);
-        if (shouldStopLoss(existing, ticker.last, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+        if (shouldStopLoss(existing, ticker.last, POLYMARKET_BOT_CONFIG.exitProfile)) {
           logger.warn(BOT_NAME, `Stop-loss triggered for ${pair}`, { entryPrice: existing.entryPrice, currentPrice: ticker.last });
           await closePosition(pair, existing, "stop-loss");
           return;
         }
 
         // 部分利確
-        if (shouldPartialTakeProfit(existing, ticker.last)) {
+        if (shouldPartialTakeProfit(existing, ticker.last, POLYMARKET_BOT_CONFIG.exitProfile)) {
           const halfAmount = existing.amount / 2;
           const closeSide = existing.side === "buy" ? "sell" as const : "buy" as const;
           const client = getOrderClient(existing.side, exchange, futuresExchange);
@@ -227,7 +227,7 @@ export function createPolymarketBot(deps: {
       for (const position of [...positions]) {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
-          if (shouldStopLoss(position, ticker.last, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+          if (shouldStopLoss(position, ticker.last, POLYMARKET_BOT_CONFIG.exitProfile)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss on ${position.pair}`, {
               entryPrice: position.entryPrice, currentPrice: ticker.last,
             });

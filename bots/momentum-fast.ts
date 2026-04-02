@@ -15,7 +15,7 @@ import {
   type Repository,
   type TradeRecord,
 } from "../types/index.js";
-import { MOMENTUM_FAST_CONFIG, INDICATOR, RISK } from "../config/settings.js";
+import { MOMENTUM_FAST_CONFIG, INDICATOR } from "../config/settings.js";
 import { calculateEMA, calculateMACD, detectSignal, isVolumeConfirmed } from "./momentum.js";
 import {
   calculatePositionSize,
@@ -68,7 +68,7 @@ export function createMomentumFastBot(deps: {
     currentPrice: number,
     atr?: number,
   ): Promise<void> {
-    if (shouldStopLoss(position, currentPrice, atr, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+    if (shouldStopLoss(position, currentPrice, MOMENTUM_FAST_CONFIG.exitProfile, atr)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair} (${position.side})`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -77,13 +77,14 @@ export function createMomentumFastBot(deps: {
       return;
     }
 
-    // 時間ベース損切り: 4時間経過で+1%未達なら決済
+    // 時間ベース損切り
+    const { timeStopMs, timeStopMinProfitPct } = MOMENTUM_FAST_CONFIG.exitProfile;
     const elapsed = Date.now() - position.openedAt;
-    if (elapsed >= RISK.TIME_STOP_MS) {
+    if (timeStopMs > 0 && elapsed >= timeStopMs) {
       const unrealizedPct = position.side === "buy"
         ? (currentPrice - position.entryPrice) / position.entryPrice
         : (position.entryPrice - currentPrice) / position.entryPrice;
-      if (unrealizedPct < RISK.TIME_STOP_MIN_PROFIT_PCT) {
+      if (unrealizedPct < timeStopMinProfitPct) {
         logger.info(BOT_NAME, `Time stop on ${pair}: ${(elapsed / 3_600_000).toFixed(1)}h elapsed, profit ${(unrealizedPct * 100).toFixed(2)}%`);
         await closePosition(pair, position, "time-stop");
         return;
@@ -91,7 +92,7 @@ export function createMomentumFastBot(deps: {
     }
 
     // 部分利確
-    if (shouldPartialTakeProfit(position, currentPrice)) {
+    if (shouldPartialTakeProfit(position, currentPrice, MOMENTUM_FAST_CONFIG.exitProfile)) {
       const halfAmount = position.amount / 2;
       const client = getOrderClient(position.side, exchange, futuresExchange);
       const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
@@ -311,7 +312,7 @@ export function createMomentumFastBot(deps: {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
           const atr = lastAtr.get(position.pair);
-          if (shouldStopLoss(position, ticker.last, atr, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+          if (shouldStopLoss(position, ticker.last, MOMENTUM_FAST_CONFIG.exitProfile, atr)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
               entryPrice: position.entryPrice,
               currentPrice: ticker.last,

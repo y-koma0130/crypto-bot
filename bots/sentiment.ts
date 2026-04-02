@@ -121,7 +121,7 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
         const ticker = await exchange.fetchTicker(position.pair);
         const currentPrice = ticker.last;
 
-        if (shouldStopLoss(position, currentPrice)) {
+        if (shouldStopLoss(position, currentPrice, SENTIMENT_CONFIG.exitProfile)) {
           logger.warn(BOT_NAME, `Stop-loss triggered for ${position.pair}`, {
             entryPrice: position.entryPrice,
             currentPrice,

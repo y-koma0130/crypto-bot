@@ -1,4 +1,4 @@
-import type { BotName, OHLCV, OrderSide, Position } from "../types/index.js";
+import type { BotName, ExitProfile, OHLCV, OrderSide, Position } from "../types/index.js";
 import { RISK } from "../config/settings.js";
 import { calculateEMA } from "./indicators.js";
 
@@ -29,72 +29,76 @@ export function calculatePositionSize(params: {
 }
 
 /**
- * トレーリングストップを考慮した損切り判定。
+ * ExitProfile ベースの段階的トレーリングストップ判定。
  *
- * 1. highWaterMark を更新（buy: 最高値、sell: 最安値）
- * 2. 含み益が TRAILING_BREAKEVEN_PCT 以上 → 損切りラインを建値に引き上げ
- * 3. 含み益が TRAILING_LOCK_PCT 以上 → 損切りラインを建値+TRAILING_LOCK_STOP_PCT に引き上げ
- * 4. 引き上げ後の損切りラインと固定損切り(-5%)のうち、有利な方で判定
+ * 1. highWaterMark を更新
+ * 2. trailingSteps を含み益が大きい順に評価し、最初にマッチした段階の損切りラインを適用
+ * 3. trailingSteps の最大閾値を超えた場合は highWaterMark - trailingPct で追跡
+ * 4. ATR が提供されている場合、ATRベースの損切りラインも計算し有利な方を採用
  */
 export function shouldStopLoss(
   position: Position,
   currentPrice: number,
+  exitProfile: ExitProfile,
   atr?: number,
-  stopLossPct?: number,
 ): boolean {
   const { entryPrice, side } = position;
 
-  // highWaterMark を更新（mutable: Position.highWaterMark は書き換え可能）
+  // highWaterMark を更新
   if (side === "buy") {
-    if (currentPrice > position.highWaterMark) {
-      position.highWaterMark = currentPrice;
-    }
+    if (currentPrice > position.highWaterMark) position.highWaterMark = currentPrice;
   } else {
-    if (currentPrice < position.highWaterMark) {
-      position.highWaterMark = currentPrice;
-    }
+    if (currentPrice < position.highWaterMark) position.highWaterMark = currentPrice;
   }
 
-  // 含み益率を計算
-  const unrealizedPct = side === "buy"
+  // 最高値/最安値からの含み益率
+  const peakPct = side === "buy"
     ? (position.highWaterMark - entryPrice) / entryPrice
     : (entryPrice - position.highWaterMark) / entryPrice;
 
-  // トレーリングストップの損切りラインを決定
   let stopPrice: number;
 
-  if (atr && atr > 0) {
-    // ATRベース: 最高値/最安値から2×ATR
-    const atrMultiplier = 2;
+  // 閾値の大きい順にソート（設定ミス防御）
+  const steps = exitProfile.trailingSteps.length > 1
+    ? [...exitProfile.trailingSteps].sort((a, b) => b[0] - a[0])
+    : exitProfile.trailingSteps;
+
+  const maxStep = steps.length > 0 ? steps[0]![0] : Infinity;
+
+  if (peakPct > maxStep && exitProfile.trailingPct > 0) {
+    // 最高値から trailingPct で追跡
     stopPrice = side === "buy"
-      ? position.highWaterMark - atr * atrMultiplier
-      : position.highWaterMark + atr * atrMultiplier;
-    // 建値以下にはしない（最低でもブレークイーブン保護）
-    if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
-      const breakevenPrice = side === "buy"
-        ? entryPrice * (1 + RISK.TRADING_FEE_PCT * 2)
-        : entryPrice * (1 - RISK.TRADING_FEE_PCT * 2);
-      stopPrice = side === "buy"
-        ? Math.max(stopPrice, breakevenPrice)
-        : Math.min(stopPrice, breakevenPrice);
-    }
+      ? position.highWaterMark * (1 - exitProfile.trailingPct)
+      : position.highWaterMark * (1 + exitProfile.trailingPct);
   } else {
-    // フォールバック: 固定パーセンテージ
-    if (unrealizedPct >= RISK.TRAILING_LOCK_PCT) {
+    // 段階的トレーリング: 含み益が大きい順に評価
+    let matched = false;
+    stopPrice = side === "buy"
+      ? entryPrice * (1 + exitProfile.stopLossPct)
+      : entryPrice * (1 - exitProfile.stopLossPct);
+
+    for (const [threshold, lockPct] of steps) {
+      if (peakPct >= threshold) {
+        stopPrice = side === "buy"
+          ? entryPrice * (1 + lockPct)
+          : entryPrice * (1 - lockPct);
+        matched = true;
+        break;
+      }
+    }
+
+    // ATRベースの損切りも考慮（有利な方を採用）
+    if (atr && atr > 0 && matched) {
+      const atrStop = side === "buy"
+        ? position.highWaterMark - atr * 2
+        : position.highWaterMark + atr * 2;
+      // ATRの方が有利（損切りラインが高い/低い）なら採用
       stopPrice = side === "buy"
-        ? entryPrice * (1 + RISK.TRAILING_LOCK_STOP_PCT)
-        : entryPrice * (1 - RISK.TRAILING_LOCK_STOP_PCT);
-    } else if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
-      stopPrice = entryPrice;
-    } else {
-      const sl = stopLossPct ?? RISK.STOP_LOSS_PCT;
-      stopPrice = side === "buy"
-        ? entryPrice * (1 + sl)
-        : entryPrice * (1 - sl);
+        ? Math.max(stopPrice, atrStop)
+        : Math.min(stopPrice, atrStop);
     }
   }
 
-  // 現在価格が損切りラインを割ったか判定
   return side === "buy" ? currentPrice <= stopPrice : currentPrice >= stopPrice;
 }
 
@@ -216,11 +220,12 @@ export function calculatePnl(params: {
 
 /**
  * 部分利確が必要か判定する。
- * 含み益が PARTIAL_TAKE_PROFIT_PCT 以上で、まだ部分利確していなければ true。
+ * ExitProfile の partialTakeProfitPct 以上で、まだ部分利確していなければ true。
  */
 export function shouldPartialTakeProfit(
   position: Position,
   currentPrice: number,
+  exitProfile: ExitProfile,
 ): boolean {
   if (position.partialTaken) return false;
 
@@ -228,7 +233,7 @@ export function shouldPartialTakeProfit(
     ? (currentPrice - position.entryPrice) / position.entryPrice
     : (position.entryPrice - currentPrice) / position.entryPrice;
 
-  return unrealizedPct >= RISK.PARTIAL_TAKE_PROFIT_PCT;
+  return unrealizedPct >= exitProfile.partialTakeProfitPct;
 }
 
 /**

@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import type { BotConfig, EnvConfig } from "../types/index.js";
+import type { BotConfig, EnvConfig, ExitProfile } from "../types/index.js";
 
 export function loadEnvConfig(): EnvConfig {
   const envFile = process.env["ENV_FILE"] ?? ".env.test";
@@ -48,6 +48,23 @@ function requireEnv(key: string): string {
   return value;
 }
 
+// ── エグジットプロファイル（共通定義） ──
+
+/** Momentum / Sentiment 共通: 大きなトレンドを追跡するプロファイル */
+const TREND_EXIT_PROFILE: ExitProfile = {
+  stopLossPct: -0.05,
+  partialTakeProfitPct: 0.04,
+  trailingSteps: [
+    [0.08, 0.055],   // +8% → 損切り+5.5%
+    [0.05, 0.03],    // +5% → 損切り+3%
+    [0.03, 0.01],    // +3% → 損切り+1%
+    [0.02, 0],        // +2% → 建値（ブレークイーブン）
+  ],
+  trailingPct: 0.03,  // +10%超は最高値から-3%で追跡
+  timeStopMs: 0,
+  timeStopMinProfitPct: 0,
+};
+
 // ── ボット設定 ──
 
 export const MOMENTUM_CONFIG: BotConfig = {
@@ -55,6 +72,7 @@ export const MOMENTUM_CONFIG: BotConfig = {
   pairs: ["BTC/USDT", "ETH/USDT"],
   timeframe: "1h",
   capitalRatio: 0.3,
+  exitProfile: TREND_EXIT_PROFILE,
 } as const;
 
 export const MOMENTUM_FAST_CONFIG: BotConfig = {
@@ -62,6 +80,18 @@ export const MOMENTUM_FAST_CONFIG: BotConfig = {
   pairs: ["BTC/USDT", "ETH/USDT"],
   timeframe: "15m",
   capitalRatio: 0.1,
+  exitProfile: {
+    stopLossPct: -0.02,
+    partialTakeProfitPct: 0.02,
+    trailingSteps: [
+      [0.03, 0.015],   // +3% → 損切り+1.5%
+      [0.02, 0.005],   // +2% → 損切り+0.5%
+      [0.015, 0],       // +1.5% → 建値
+    ],
+    trailingPct: 0.015, // 最高値から-1.5%で追跡
+    timeStopMs: 4 * 60 * 60 * 1000,
+    timeStopMinProfitPct: 0.01,
+  },
 } as const;
 
 export const RANGE_CONFIG: BotConfig = {
@@ -69,6 +99,18 @@ export const RANGE_CONFIG: BotConfig = {
   pairs: ["XRP/USDT", "SOL/USDT"],
   timeframe: "15m",
   capitalRatio: 0.35,
+  exitProfile: {
+    stopLossPct: -0.02,
+    partialTakeProfitPct: 0.015,
+    trailingSteps: [
+      [0.02, 0.01],    // +2% → 損切り+1%
+      [0.015, 0.005],  // +1.5% → 損切り+0.5%
+      [0.01, 0],        // +1% → 建値
+    ],
+    trailingPct: 0.01,  // 最高値から-1%で追跡
+    timeStopMs: 0,
+    timeStopMinProfitPct: 0,
+  },
 } as const;
 
 export const POLYMARKET_BOT_CONFIG: BotConfig = {
@@ -76,6 +118,18 @@ export const POLYMARKET_BOT_CONFIG: BotConfig = {
   pairs: ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"],
   timeframe: "15m",
   capitalRatio: 0.05,
+  exitProfile: {
+    stopLossPct: -0.02,
+    partialTakeProfitPct: 0.03,
+    trailingSteps: [
+      [0.05, 0.03],    // +5% → 損切り+3%
+      [0.03, 0.015],   // +3% → 損切り+1.5%
+      [0.02, 0],        // +2% → 建値
+    ],
+    trailingPct: 0.02,  // 最高値から-2%で追跡
+    timeStopMs: 0,
+    timeStopMinProfitPct: 0,
+  },
 } as const;
 
 export const SENTIMENT_CONFIG: BotConfig = {
@@ -83,15 +137,12 @@ export const SENTIMENT_CONFIG: BotConfig = {
   pairs: ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"],
   timeframe: "1h",
   capitalRatio: 0.2,
+  exitProfile: TREND_EXIT_PROFILE,
 } as const;
 
 // ── リスク管理定数 ──
 
 export const RISK = {
-  /** 損切りライン（デフォルト: Momentum用 -5%） */
-  STOP_LOSS_PCT: -0.05,
-  /** 短期ボット用損切りライン（Momentum Fast / Range: -2%） */
-  STOP_LOSS_PCT_SHORT_TERM: -0.02,
   /** 各ボット最大同時ポジション数 */
   MAX_POSITIONS_PER_BOT: 1,
   /** ボット合計最大同時ポジション数 */
@@ -102,30 +153,18 @@ export const RISK = {
   TRADING_FEE_PCT: 0.001,
   /** スリッページ許容（0.5%） */
   SLIPPAGE_TOLERANCE_PCT: 0.005,
-  /** トレーリングストップ: 損切りラインを建値に移動する閾値 */
-  TRAILING_BREAKEVEN_PCT: 0.015,
-  /** トレーリングストップ: 損切りラインを引き上げる閾値 */
-  TRAILING_LOCK_PCT: 0.03,
-  /** トレーリングストップ: 引き上げ後の損切りライン（建値からの%） */
-  TRAILING_LOCK_STOP_PCT: 0.01,
   /** ATR フィルター: ATRが平均の何倍以上でトレンドとみなすか */
   ATR_TREND_MULTIPLIER: 1.1,
   /** 1トレードあたりのリスク = 資本の1% */
   RISK_PER_TRADE_PCT: 0.01,
   /** 同方向ポジション上限 */
   MAX_SAME_DIRECTION: 2,
-  /** 部分利確: この含み益で半分決済 */
-  PARTIAL_TAKE_PROFIT_PCT: 0.02,
   /** 日足トレンドフィルター用EMA期間 */
   DAILY_TREND_EMA_PERIOD: 20,
   /** 連敗制御: この回数連続で負けたら次のtickをスキップ */
   MAX_CONSECUTIVE_LOSSES: 3,
   /** 相関フィルター: BTCの直近1h変動がこれ以下ならアルトのロングをブロック */
   BTC_CRASH_THRESHOLD_PCT: -0.02,
-  /** 時間ベース損切り: この時間（ms）経過で利益未達なら決済（Momentum Fast用） */
-  TIME_STOP_MS: 4 * 60 * 60 * 1000,
-  /** 時間ベース損切りの最低利益率 */
-  TIME_STOP_MIN_PROFIT_PCT: 0.01,
 } as const;
 
 // ── テクニカル指標パラメータ ──

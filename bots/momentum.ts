@@ -199,7 +199,7 @@ export function createMomentumBot(deps: {
     atr?: number,
   ): Promise<void> {
     // Stop-loss check
-    if (shouldStopLoss(position, currentPrice, atr)) {
+    if (shouldStopLoss(position, currentPrice, MOMENTUM_CONFIG.exitProfile, atr)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair} (${position.side})`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -208,8 +208,8 @@ export function createMomentumBot(deps: {
       return;
     }
 
-    // 部分利確: +2%で半分決済
-    if (shouldPartialTakeProfit(position, currentPrice)) {
+    // 部分利確
+    if (shouldPartialTakeProfit(position, currentPrice, MOMENTUM_CONFIG.exitProfile)) {
       const halfAmount = position.amount / 2;
       const client = getOrderClient(position.side, exchange, futuresExchange);
       const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
@@ -555,7 +555,7 @@ export function createMomentumBot(deps: {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
           const atr = lastAtr.get(position.pair);
-          if (shouldStopLoss(position, ticker.last, atr)) {
+          if (shouldStopLoss(position, ticker.last, MOMENTUM_CONFIG.exitProfile, atr)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
               entryPrice: position.entryPrice,
               currentPrice: ticker.last,

@@ -69,11 +69,28 @@ export interface Position {
 
 export type BotName = "momentum" | "momentum-fast" | "range" | "sentiment" | "polymarket";
 
+/** ボット別エグジットプロファイル */
+export interface ExitProfile {
+  /** 損切り（例: -0.05 = -5%） */
+  readonly stopLossPct: number;
+  /** 部分利確の閾値（例: 0.04 = +4%で半分決済） */
+  readonly partialTakeProfitPct: number;
+  /** トレーリング段階: [含み益閾値, 損切りライン][] を含み益が大きい順に評価 */
+  readonly trailingSteps: readonly (readonly [number, number])[];
+  /** 最高値から常に追跡する幅（例: 0.03 = -3%）。trailingStepsの最大閾値を超えたら適用 */
+  readonly trailingPct: number;
+  /** 時間ベース損切り: この時間（ms）経過で利益未達なら決済。0なら無効 */
+  readonly timeStopMs: number;
+  /** 時間ベース損切りの最低利益率 */
+  readonly timeStopMinProfitPct: number;
+}
+
 export interface BotConfig {
   readonly name: BotName;
   readonly pairs: readonly TradingPair[];
   readonly timeframe: Timeframe;
   readonly capitalRatio: number;
+  readonly exitProfile: ExitProfile;
 }
 
 // ── GPT 分析 ──

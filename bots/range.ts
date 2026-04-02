@@ -3,7 +3,7 @@ import {
   type Exchange, type FuturesExchange, type GPTClient, type Logger, type OHLCV, type Position, type TradingPair, type BollingerBands, type OrderSide, type Repository, type TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
-import { RANGE_CONFIG, INDICATOR, RISK } from "../config/settings.js";
+import { RANGE_CONFIG, INDICATOR } from "../config/settings.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -247,7 +247,7 @@ export function createRangeBot(deps: {
     currentPrice: number,
   ): Promise<void> {
     // Stop-loss check
-    if (shouldStopLoss(position, currentPrice, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+    if (shouldStopLoss(position, currentPrice, RANGE_CONFIG.exitProfile)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair}`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -257,7 +257,7 @@ export function createRangeBot(deps: {
     }
 
     // 部分利確
-    if (shouldPartialTakeProfit(position, currentPrice)) {
+    if (shouldPartialTakeProfit(position, currentPrice, RANGE_CONFIG.exitProfile)) {
       const halfAmount = position.amount / 2;
       const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
       const client = getOrderClient(position.side, exchange, futuresExchange);
@@ -594,7 +594,7 @@ export function createRangeBot(deps: {
       for (const position of [...positions]) {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
-          if (shouldStopLoss(position, ticker.last, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
+          if (shouldStopLoss(position, ticker.last, RANGE_CONFIG.exitProfile)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
               entryPrice: position.entryPrice,
               currentPrice: ticker.last,
