@@ -154,6 +154,8 @@ export interface TradeRecord {
   readonly entry_price: number;
   readonly exit_price?: number;
   readonly pnl?: number;
+  readonly partial_amount?: number;
+  readonly partial_at?: string;
   readonly status: "open" | "closed";
   readonly created_at?: string;
   readonly closed_at?: string;
@@ -179,6 +181,7 @@ export interface BotStatusRecord {
 export interface Repository {
   insertTrade(trade: TradeRecord): Promise<string>;
   closeTrade(id: string, exitPrice: number, pnl: number): Promise<void>;
+  recordPartialTakeProfit(id: string, exitPrice: number, amount: number, pnl: number): Promise<void>;
   findOpenTrade(botName: BotName, symbol: TradingPair): Promise<TradeRecord | null>;
   findOpenTrades(botName: BotName): Promise<TradeRecord[]>;
   getRecentClosedPnls(botName: BotName, limit: number): Promise<number[]>;

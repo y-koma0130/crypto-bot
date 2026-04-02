@@ -47,6 +47,10 @@ export function createMockRepository(): Repository {
       // no-op
     },
 
+    async recordPartialTakeProfit(): Promise<void> {
+      // no-op
+    },
+
     async getRecentClosedPnls(): Promise<number[]> {
       return [];
     },

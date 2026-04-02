@@ -361,13 +361,18 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
     getPositions: () => [...positions],
     restorePositions(openTrades: readonly TradeRecord[]): void {
       for (const trade of openTrades) {
+        const alreadyPartial = trade.partial_at != null;
+        const restoredAmount = alreadyPartial && trade.partial_amount
+          ? trade.amount - trade.partial_amount
+          : trade.amount;
         positions.push({
           pair: trade.symbol,
           side: trade.side,
           entryPrice: trade.entry_price,
-          amount: trade.amount,
+          amount: restoredAmount,
           openedAt: trade.created_at ? new Date(trade.created_at).getTime() : Date.now(),
           highWaterMark: trade.entry_price,
+          partialTaken: alreadyPartial,
         });
         if (trade.id) {
           tradeIds.set(trade.symbol, trade.id);

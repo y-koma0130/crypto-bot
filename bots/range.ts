@@ -262,10 +262,18 @@ export function createRangeBot(deps: {
       const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
       const client = getOrderClient(position.side, exchange, futuresExchange);
       try {
-        await client.createOrder({ pair, side: closeSide, amount: halfAmount });
+        const result = await client.createOrder({ pair, side: closeSide, amount: halfAmount });
+        const partialPnl = calculatePnl({ side: position.side, entryPrice: position.entryPrice, exitPrice: result.price, amount: halfAmount });
         position.amount -= halfAmount;
         position.partialTaken = true;
-        logger.info(BOT_NAME, `Partial take-profit on ${pair}: closed half`, { remainingAmount: position.amount });
+        logger.info(BOT_NAME, `Partial take-profit on ${pair}: pnl ${partialPnl.toFixed(2)}`, { remainingAmount: position.amount });
+        const tradeId = tradeIds.get(pair);
+        if (tradeId) {
+          void repo.recordPartialTakeProfit(tradeId, result.price, halfAmount, partialPnl).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error(BOT_NAME, "Failed to record partial take-profit", { error: msg });
+          });
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error(BOT_NAME, `Failed partial take-profit on ${pair}`, { error: message });
@@ -575,13 +583,18 @@ export function createRangeBot(deps: {
 
     restorePositions(openTrades: readonly TradeRecord[]): void {
       for (const trade of openTrades) {
+        const alreadyPartial = trade.partial_at != null;
+        const restoredAmount = alreadyPartial && trade.partial_amount
+          ? trade.amount - trade.partial_amount
+          : trade.amount;
         positions.push({
           pair: trade.symbol,
           side: trade.side,
           entryPrice: trade.entry_price,
-          amount: trade.amount,
+          amount: restoredAmount,
           openedAt: trade.created_at ? new Date(trade.created_at).getTime() : Date.now(),
           highWaterMark: trade.entry_price,
+          partialTaken: alreadyPartial,
         });
         if (trade.id) {
           tradeIds.set(trade.symbol, trade.id);
