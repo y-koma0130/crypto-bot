@@ -81,8 +81,10 @@ export const SENTIMENT_CONFIG: BotConfig = {
 // ── リスク管理定数 ──
 
 export const RISK = {
-  /** 損切りライン（-5%） */
+  /** 損切りライン（デフォルト: Momentum用 -5%） */
   STOP_LOSS_PCT: -0.05,
+  /** 短期ボット用損切りライン（Momentum Fast / Range: -2%） */
+  STOP_LOSS_PCT_SHORT_TERM: -0.02,
   /** 各ボット最大同時ポジション数 */
   MAX_POSITIONS_PER_BOT: 1,
   /** ボット合計最大同時ポジション数 */
@@ -94,17 +96,21 @@ export const RISK = {
   /** スリッページ許容（0.5%） */
   SLIPPAGE_TOLERANCE_PCT: 0.005,
   /** トレーリングストップ: 損切りラインを建値に移動する閾値 */
-  TRAILING_BREAKEVEN_PCT: 0.03,
+  TRAILING_BREAKEVEN_PCT: 0.015,
   /** トレーリングストップ: 損切りラインを引き上げる閾値 */
-  TRAILING_LOCK_PCT: 0.05,
+  TRAILING_LOCK_PCT: 0.03,
   /** トレーリングストップ: 引き上げ後の損切りライン（建値からの%） */
-  TRAILING_LOCK_STOP_PCT: 0.02,
+  TRAILING_LOCK_STOP_PCT: 0.01,
   /** ATR フィルター: ATRが平均の何倍以上でトレンドとみなすか */
   ATR_TREND_MULTIPLIER: 1.1,
   /** 1トレードあたりのリスク = 資本の1% */
   RISK_PER_TRADE_PCT: 0.01,
   /** 同方向ポジション上限 */
   MAX_SAME_DIRECTION: 2,
+  /** 日足トレンドフィルター用EMA期間 */
+  DAILY_TREND_EMA_PERIOD: 20,
+  /** 連敗制御: この回数連続で負けたら次のtickをスキップ */
+  MAX_CONSECUTIVE_LOSSES: 3,
 } as const;
 
 // ── テクニカル指標パラメータ ──

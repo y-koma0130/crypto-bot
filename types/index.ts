@@ -162,6 +162,7 @@ export interface Repository {
   closeTrade(id: string, exitPrice: number, pnl: number): Promise<void>;
   findOpenTrade(botName: BotName, symbol: TradingPair): Promise<TradeRecord | null>;
   findOpenTrades(botName: BotName): Promise<TradeRecord[]>;
+  getRecentClosedPnls(botName: BotName, limit: number): Promise<number[]>;
   insertSignal(signal: SignalRecord): Promise<void>;
   updateBotStatus(status: BotStatusRecord): Promise<void>;
   getDailyPnl(): Promise<number>;

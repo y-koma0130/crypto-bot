@@ -171,6 +171,25 @@ export function createRepository(config: EnvConfig, logger: Logger): Repository 
       }
     },
 
+    async getRecentClosedPnls(botName: BotName, limit: number): Promise<number[]> {
+      try {
+        const rows = await db
+          .select({ pnl: trades.pnl })
+          .from(trades)
+          .where(and(eq(trades.botName, botName), eq(trades.status, "closed")))
+          .orderBy(desc(trades.closedAt))
+          .limit(limit);
+
+        return rows
+          .filter((r) => r.pnl != null)
+          .map((r) => Number(r.pnl));
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error("system", "Failed to get recent PnLs", { error: message });
+        return [];
+      }
+    },
+
     async updateBotStatus(status: BotStatusRecord): Promise<void> {
       try {
         await db

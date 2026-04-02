@@ -12,6 +12,7 @@ import {
   type TradeRecord,
 } from "../types/index.js";
 import { MOMENTUM_CONFIG, INDICATOR } from "../config/settings.js";
+import { calculateADX } from "./range.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -21,52 +22,9 @@ import {
   isVolatilityExpanding,
 } from "../core/risk.js";
 
-// ── EMA calculation (pure function, exported for testing) ──
-
-/**
- * Compute Exponential Moving Average for a candle series.
- *
- *   EMA_today = close * k + EMA_yesterday * (1 - k)
- *   k = 2 / (period + 1)
- *
- * Returns an array aligned with `candles`. The first `period - 1` entries
- * are NaN because there is not enough data to seed the EMA.
- */
-export function calculateEMA(
-  candles: readonly OHLCV[],
-  period: number,
-): number[] {
-  if (candles.length === 0) return [];
-
-  const k = 2 / (period + 1);
-  const ema: number[] = new Array<number>(candles.length);
-
-  // First period-1 entries: insufficient data → NaN
-  for (let i = 0; i < Math.min(period - 1, candles.length); i++) {
-    ema[i] = NaN;
-  }
-
-  if (candles.length < period) return ema;
-
-  // Seed EMA with SMA of the first `period` closes
-  let sum = 0;
-  for (let i = 0; i < period; i++) {
-    const candle = candles[i];
-    if (candle === undefined) return ema;
-    sum += candle.close;
-  }
-  ema[period - 1] = sum / period;
-
-  // EMA recurrence from period onward
-  for (let i = period; i < candles.length; i++) {
-    const candle = candles[i];
-    const prev = ema[i - 1];
-    if (candle === undefined || prev === undefined) break;
-    ema[i] = candle.close * k + prev * (1 - k);
-  }
-
-  return ema;
-}
+// Re-export from shared module for backward compatibility
+import { calculateEMA } from "../core/indicators.js";
+export { calculateEMA };
 
 // ── MACD calculation (pure function, exported for testing) ──
 
@@ -208,8 +166,9 @@ export function createMomentumBot(deps: {
   capitalUsd: number;
   repo: Repository;
   futuresExchange?: FuturesExchange;
+  getDailyTrend?: (pair: TradingPair) => Promise<"buy" | "sell" | null>;
 }): MomentumBot {
-  const { exchange, gpt, logger, capitalUsd, repo, futuresExchange } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = MOMENTUM_CONFIG.name;
 
   // Mutable internal position state (closure)
@@ -352,20 +311,10 @@ export function createMomentumBot(deps: {
     }
     supplementary.push({ name: "mtf_4h", passed: mtfOk });
 
-    // S4. GPTレジーム判定
-    let gptOk = false;
-    try {
-      const regime = await gpt.classifyMarketRegime(pair, [...confirmedCandles]);
-      logger.info(BOT_NAME, `GPT regime for ${pair}: ${regime.regime}`, {
-        confidence: regime.confidence,
-        reasoning: regime.reasoning,
-      });
-      gptOk = regime.regime !== "RANGING";
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `GPT regime check failed for ${pair}`, { error: message });
-    }
-    supplementary.push({ name: "gpt_regime", passed: gptOk });
+    // S4. ADXレジーム判定（GPTの代わりにテクニカルで判定、トークンコスト0）
+    const adx = calculateADX(confirmedCandles, INDICATOR.ADX_PERIOD);
+    const adxOk = adx > INDICATOR.ADX_TREND_THRESHOLD;
+    supplementary.push({ name: "adx_trending", passed: adxOk });
 
     const passedCount = supplementary.filter((s) => s.passed).length;
     const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
@@ -413,6 +362,15 @@ export function createMomentumBot(deps: {
     if (!canOpenPosition(positions, BOT_NAME, allPositions, side)) {
       logger.info(BOT_NAME, `Position limit reached, skipping ${direction} on ${pair}`);
       return;
+    }
+
+    // 日足トレンドフィルター: 日足EMAに逆らう方向はスキップ
+    if (getDailyTrend) {
+      const allowed = await getDailyTrend(pair);
+      if (allowed && allowed !== side) {
+        logger.info(BOT_NAME, `Daily trend filter: ${direction} blocked on ${pair} (daily trend: ${allowed === "buy" ? "bullish" : "bearish"})`);
+        return;
+      }
     }
 
     // 参考指標評価

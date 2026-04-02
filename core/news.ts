@@ -25,6 +25,8 @@ const MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6時間
 
 export interface NewsFetcher {
   fetchNews(pair: TradingPair): Promise<string[]>;
+  /** Polymarketの確率がシグナル方向と矛盾するか判定（GPT不要のフィルター） */
+  isPolymarketContradicting(pair: TradingPair, side: "buy" | "sell"): boolean;
 }
 
 // ── Polymarket Gamma API ──
@@ -190,6 +192,40 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
         logger.error("system", "News fetch failed", { pair, error: message });
         return [];
       }
+    },
+
+    isPolymarketContradicting(pair: TradingPair, side: "buy" | "sell"): boolean {
+      const pairKeywords = PAIR_KEYWORDS[pair];
+      const relevant = cachedPolymarkets.filter((m) => {
+        const q = m.question.toLowerCase();
+        return pairKeywords.some((kw) => q.includes(kw));
+      });
+
+      for (const market of relevant) {
+        try {
+          const prices: number[] = JSON.parse(market.outcomePrices) as number[];
+          const outcomes: string[] = JSON.parse(market.outcomes) as string[];
+          const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+          if (yesIdx === -1 || prices[yesIdx] === undefined) continue;
+
+          const yesPct = prices[yesIdx];
+          const q = market.question.toLowerCase();
+          const isBullishQuestion = q.includes("above") || q.includes("rise") || q.includes("bull") || q.includes("approve") || q.includes("rally") || q.includes("surge") || q.includes("exceed") || q.includes("reach") || q.includes("high");
+          const isBearishQuestion = q.includes("below") || q.includes("drop") || q.includes("crash") || q.includes("ban") || q.includes("fall") || q.includes("decline") || q.includes("dump") || q.includes("low");
+
+          // 強気の質問で60%超Yesなのにsellしようとしている → 矛盾
+          if (isBullishQuestion && yesPct > 0.6 && side === "sell") return true;
+          // 弱気の質問で60%超Yesなのにbuyしようとしている → 矛盾
+          if (isBearishQuestion && yesPct > 0.6 && side === "buy") return true;
+          // 強気の質問で60%超Noなのにbuyしようとしている → 矛盾
+          if (isBullishQuestion && yesPct < 0.4 && side === "buy") return true;
+          // 弱気の質問で60%超Noなのにsellしようとしている → 矛盾
+          if (isBearishQuestion && yesPct < 0.4 && side === "sell") return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
     },
   };
 }

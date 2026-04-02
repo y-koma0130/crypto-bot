@@ -15,7 +15,7 @@ import {
   type Repository,
   type TradeRecord,
 } from "../types/index.js";
-import { MOMENTUM_FAST_CONFIG, INDICATOR } from "../config/settings.js";
+import { MOMENTUM_FAST_CONFIG, INDICATOR, RISK } from "../config/settings.js";
 import { calculateEMA, calculateMACD, detectSignal, isVolumeConfirmed } from "./momentum.js";
 import {
   calculatePositionSize,
@@ -40,8 +40,9 @@ export function createMomentumFastBot(deps: {
   capitalUsd: number;
   repo: Repository;
   futuresExchange?: FuturesExchange;
+  getDailyTrend?: (pair: TradingPair) => Promise<"buy" | "sell" | null>;
 }): MomentumFastBot {
-  const { exchange, logger, capitalUsd, repo, futuresExchange } = deps;
+  const { exchange, logger, capitalUsd, repo, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = MOMENTUM_FAST_CONFIG.name;
 
   const positions: Position[] = [];
@@ -66,7 +67,7 @@ export function createMomentumFastBot(deps: {
     currentPrice: number,
     atr?: number,
   ): Promise<void> {
-    if (shouldStopLoss(position, currentPrice, atr)) {
+    if (shouldStopLoss(position, currentPrice, atr, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair} (${position.side})`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -147,6 +148,15 @@ export function createMomentumFastBot(deps: {
     if (isLong ? macd.histogram <= 0 : macd.histogram >= 0) return;
 
     if (!canOpenPosition(positions, BOT_NAME, allPositions, side)) return;
+
+    // 日足トレンドフィルター
+    if (getDailyTrend) {
+      const allowed = await getDailyTrend(pair);
+      if (allowed && allowed !== side) {
+        logger.info(BOT_NAME, `Daily trend filter: ${direction} blocked on ${pair}`);
+        return;
+      }
+    }
 
     // 参考指標（2つ中1つ以上）
     const volumeOk = isVolumeConfirmed(confirmedCandles);
@@ -271,7 +281,7 @@ export function createMomentumFastBot(deps: {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
           const atr = lastAtr.get(position.pair);
-          if (shouldStopLoss(position, ticker.last, atr)) {
+          if (shouldStopLoss(position, ticker.last, atr, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
               entryPrice: position.entryPrice,
               currentPrice: ticker.last,

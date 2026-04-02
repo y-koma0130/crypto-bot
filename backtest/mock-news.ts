@@ -11,5 +11,8 @@ export function createMockNewsFetcher(): NewsFetcher {
     async fetchNews(_pair: TradingPair): Promise<string[]> {
       return [];
     },
+    isPolymarketContradicting(): boolean {
+      return false;
+    },
   };
 }

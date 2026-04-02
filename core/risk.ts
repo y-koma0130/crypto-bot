@@ -1,5 +1,6 @@
-import type { BotName, OHLCV, Position } from "../types/index.js";
+import type { BotName, OHLCV, OrderSide, Position } from "../types/index.js";
 import { RISK } from "../config/settings.js";
+import { calculateEMA } from "./indicators.js";
 
 /**
  * ポジションサイズを計算する。
@@ -39,6 +40,7 @@ export function shouldStopLoss(
   position: Position,
   currentPrice: number,
   atr?: number,
+  stopLossPct?: number,
 ): boolean {
   const { entryPrice, side } = position;
 
@@ -85,9 +87,10 @@ export function shouldStopLoss(
     } else if (unrealizedPct >= RISK.TRAILING_BREAKEVEN_PCT) {
       stopPrice = entryPrice;
     } else {
+      const sl = stopLossPct ?? RISK.STOP_LOSS_PCT;
       stopPrice = side === "buy"
-        ? entryPrice * (1 + RISK.STOP_LOSS_PCT)
-        : entryPrice * (1 - RISK.STOP_LOSS_PCT);
+        ? entryPrice * (1 + sl)
+        : entryPrice * (1 - sl);
     }
   }
 
@@ -209,4 +212,37 @@ export function calculatePnl(params: {
   const exitFee = exitPrice * amount * RISK.TRADING_FEE_PCT;
 
   return rawPnl - entryFee - exitFee;
+}
+
+/**
+ * 日足EMAに基づいて許可されるトレード方向を判定する。
+ * 価格がEMA上 → ロングのみ許可、EMA下 → ショートのみ許可。
+ */
+export function getAllowedSide(
+  dailyCandles: readonly OHLCV[],
+  emaPeriod: number,
+): OrderSide | null {
+  if (dailyCandles.length < emaPeriod) return null;
+
+  const ema = calculateEMA(dailyCandles, emaPeriod);
+  const lastEma = ema[ema.length - 1];
+  if (lastEma === undefined || Number.isNaN(lastEma)) return null;
+
+  const lastClose = dailyCandles[dailyCandles.length - 1]!.close;
+  return lastClose >= lastEma ? "buy" : "sell";
+}
+
+/**
+ * 連敗制御: 直近のクローズ済みトレードから連敗数をカウントする。
+ */
+export function countConsecutiveLosses(recentPnls: readonly number[]): number {
+  let count = 0;
+  for (let i = recentPnls.length - 1; i >= 0; i--) {
+    if (recentPnls[i]! < 0) {
+      count++;
+    } else {
+      break;
+    }
+  }
+  return count;
 }

@@ -9,8 +9,9 @@ import { createMomentumBot } from "./bots/momentum.js";
 import { createMomentumFastBot } from "./bots/momentum-fast.js";
 import { createRangeBot } from "./bots/range.js";
 import { createSentimentBot } from "./bots/sentiment.js";
-import { isDailyLossLimitReached } from "./core/risk.js";
-import type { BotName, Position } from "./types/index.js";
+import { isDailyLossLimitReached, getAllowedSide, countConsecutiveLosses } from "./core/risk.js";
+import { RISK } from "./config/settings.js";
+import type { BotName, OrderSide, Position, TradingPair } from "./types/index.js";
 
 async function main(): Promise<void> {
   const logger = createLogger();
@@ -52,6 +53,10 @@ async function main(): Promise<void> {
 
   const newsFetcher = createNewsFetcher(logger);
 
+  // getDailyTrend は後で定義されるが、ボットはtick時に呼ぶので遅延参照で問題ない
+  let getDailyTrendFn: ((pair: TradingPair) => Promise<OrderSide | null>) | undefined;
+  const getDailyTrendProxy = (pair: TradingPair) => getDailyTrendFn ? getDailyTrendFn(pair) : Promise.resolve(null as OrderSide | null);
+
   const sentimentBot = createSentimentBot({
     exchange,
     gpt,
@@ -60,6 +65,7 @@ async function main(): Promise<void> {
     repo,
     newsFetcher,
     futuresExchange,
+    getDailyTrend: getDailyTrendProxy,
   });
 
   const momentumBot = createMomentumBot({
@@ -69,6 +75,7 @@ async function main(): Promise<void> {
     capitalUsd: config.totalCapital,
     repo,
     futuresExchange,
+    getDailyTrend: getDailyTrendProxy,
   });
 
   const momentumFastBot = createMomentumFastBot({
@@ -78,6 +85,7 @@ async function main(): Promise<void> {
     capitalUsd: config.totalCapital,
     repo,
     futuresExchange,
+    getDailyTrend: getDailyTrendProxy,
   });
 
   const rangeBot = createRangeBot({
@@ -88,6 +96,7 @@ async function main(): Promise<void> {
     repo,
     newsFetcher,
     futuresExchange,
+    getDailyTrend: getDailyTrendProxy,
   });
 
   // ── 起動時ヘルスチェック ──
@@ -114,6 +123,56 @@ async function main(): Promise<void> {
   }
 
   await healthCheck();
+
+  // ── 日足トレンドフィルター（1時間キャッシュ） ──
+  const dailyTrendCache = new Map<TradingPair, { side: OrderSide | null; expiresAt: number }>();
+  const ALL_PAIRS: TradingPair[] = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"];
+
+  async function getDailyTrend(pair: TradingPair): Promise<OrderSide | null> {
+    const cached = dailyTrendCache.get(pair);
+    if (cached && Date.now() < cached.expiresAt) return cached.side;
+
+    try {
+      const dailyCandles = await exchange.fetchOHLCV(pair, "1d", RISK.DAILY_TREND_EMA_PERIOD + 5);
+      const side = getAllowedSide(dailyCandles, RISK.DAILY_TREND_EMA_PERIOD);
+      dailyTrendCache.set(pair, { side, expiresAt: Date.now() + 60 * 60 * 1000 });
+      logger.info("system", `Daily trend for ${pair}: ${side === "buy" ? "BULLISH" : "BEARISH"}`, { pair, allowedSide: side });
+      return side;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("system", `Failed to fetch daily trend for ${pair}`, { error: message });
+      return null; // フィルターを適用しない
+    }
+  }
+
+  /** 日足トレンドに逆らうポジションがないか全ペアで確認 */
+  async function refreshDailyTrends(): Promise<void> {
+    await Promise.all(ALL_PAIRS.map((pair) => getDailyTrend(pair)));
+  }
+
+  // ボットに渡したプロキシを接続
+  getDailyTrendFn = getDailyTrend;
+
+  // ── 連敗制御（5分キャッシュ — トレードクローズは稀なので頻繁にDBを叩く必要なし） ──
+  const losingStreakCache = new Map<BotName, { value: boolean; expiresAt: number }>();
+
+  async function isOnLosingStreak(botName: BotName): Promise<boolean> {
+    const cached = losingStreakCache.get(botName);
+    if (cached && Date.now() < cached.expiresAt) return cached.value;
+
+    try {
+      const recentPnls = await repo.getRecentClosedPnls(botName, RISK.MAX_CONSECUTIVE_LOSSES);
+      const streak = countConsecutiveLosses(recentPnls);
+      const result = streak >= RISK.MAX_CONSECUTIVE_LOSSES;
+      losingStreakCache.set(botName, { value: result, expiresAt: Date.now() + 5 * 60_000 });
+      if (result) {
+        logger.warn(botName, `Losing streak (${String(streak)} consecutive losses) — skipping tick`);
+      }
+      return result;
+    } catch {
+      return false;
+    }
+  }
 
   function getAllPositions(): readonly Position[] {
     return [
@@ -177,18 +236,12 @@ async function main(): Promise<void> {
 
   async function tickMomentum(): Promise<void> {
     if (shuttingDown) return;
-    if (sentimentBot.isHalted()) {
-      logger.warn("momentum", "Skipping tick — HALT active");
-      return;
-    }
-    if (await checkDailyLossLimit()) {
-      logger.warn("momentum", "Skipping tick — daily loss limit reached");
-      return;
-    }
+    if (sentimentBot.isHalted()) { logger.warn("momentum", "Skipping tick — HALT active"); return; }
+    if (await checkDailyLossLimit()) { logger.warn("momentum", "Skipping tick — daily loss limit reached"); return; }
+    if (await isOnLosingStreak("momentum")) return;
     try {
       await momentumBot.tick(getAllPositions());
       updateBotStatus("momentum", momentumBot.getPositions());
-      logger.info("momentum", "Momentum tick complete");
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error("momentum", `Momentum tick failed: ${message}`);
@@ -197,18 +250,12 @@ async function main(): Promise<void> {
 
   async function tickMomentumFast(): Promise<void> {
     if (shuttingDown) return;
-    if (sentimentBot.isHalted()) {
-      logger.warn("momentum-fast", "Skipping tick — HALT active");
-      return;
-    }
-    if (await checkDailyLossLimit()) {
-      logger.warn("momentum-fast", "Skipping tick — daily loss limit reached");
-      return;
-    }
+    if (sentimentBot.isHalted()) { logger.warn("momentum-fast", "Skipping tick — HALT active"); return; }
+    if (await checkDailyLossLimit()) { logger.warn("momentum-fast", "Skipping tick — daily loss limit reached"); return; }
+    if (await isOnLosingStreak("momentum-fast")) return;
     try {
       await momentumFastBot.tick(getAllPositions());
       updateBotStatus("momentum-fast", momentumFastBot.getPositions());
-      logger.info("momentum-fast", "Momentum-fast tick complete");
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error("momentum-fast", `Momentum-fast tick failed: ${message}`);
@@ -217,14 +264,9 @@ async function main(): Promise<void> {
 
   async function tickRange(): Promise<void> {
     if (shuttingDown) return;
-    if (sentimentBot.isHalted()) {
-      logger.warn("range", "Skipping tick — HALT active");
-      return;
-    }
-    if (await checkDailyLossLimit()) {
-      logger.warn("range", "Skipping tick — daily loss limit reached");
-      return;
-    }
+    if (sentimentBot.isHalted()) { logger.warn("range", "Skipping tick — HALT active"); return; }
+    if (await checkDailyLossLimit()) { logger.warn("range", "Skipping tick — daily loss limit reached"); return; }
+    if (await isOnLosingStreak("range")) return;
     try {
       await rangeBot.tick(getAllPositions());
       updateBotStatus("range", rangeBot.getPositions());
@@ -307,6 +349,9 @@ async function main(): Promise<void> {
   rangeBot.restorePositions(rangeTrades);
 
   logger.info("system", "All cron jobs scheduled. Bot is running.");
+
+  // 起動直後に日足トレンドをキャッシュ
+  await refreshDailyTrends();
 
   // 起動直後に1回実行（センチメント→他ボットの順で、HALT判定を先に行う）
   await sentimentMutex.run(tickSentiment);

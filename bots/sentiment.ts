@@ -33,12 +33,13 @@ interface SentimentBotDeps {
   readonly repo: Repository;
   readonly newsFetcher: NewsFetcher;
   readonly futuresExchange?: FuturesExchange;
+  readonly getDailyTrend?: (pair: TradingPair) => Promise<"buy" | "sell" | null>;
 }
 
 // ── Factory ──
 
 export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = SENTIMENT_CONFIG.name;
 
   let positions: Position[] = [];
@@ -156,8 +157,14 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
       const existingPosition = positions.find((p) => p.pair === pair);
 
+      // 日足トレンドフィルター
+      let dailyAllowed: "buy" | "sell" | null = null;
+      if (getDailyTrend) {
+        dailyAllowed = await getDailyTrend(pair);
+      }
+
       // BULLISH: consider opening a buy position
-      if (sentiment.level === "BULLISH" && !existingPosition) {
+      if (sentiment.level === "BULLISH" && !existingPosition && dailyAllowed !== "sell") {
         if (!canOpenPosition(positions, BOT_NAME, allPositions, "buy")) {
           logger.debug(BOT_NAME, `Cannot open position for ${pair} — limit reached`);
           continue;
@@ -216,8 +223,8 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
           }
         }
 
-        // ショートエントリー（先物経由）
-        if (!existingPosition && futuresExchange) {
+        // ショートエントリー（先物経由、日足トレンドがbuyならスキップ）
+        if (!existingPosition && futuresExchange && dailyAllowed !== "buy") {
           if (!canOpenPosition(positions, BOT_NAME, allPositions, "sell")) {
             logger.debug(BOT_NAME, `Cannot open short position for ${pair} — limit reached`);
             continue;

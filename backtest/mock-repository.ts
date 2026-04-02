@@ -47,6 +47,10 @@ export function createMockRepository(): Repository {
       // no-op
     },
 
+    async getRecentClosedPnls(): Promise<number[]> {
+      return [];
+    },
+
     async getDailyPnl(): Promise<number> {
       return 0;
     },

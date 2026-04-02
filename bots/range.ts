@@ -3,7 +3,7 @@ import {
   type Exchange, type FuturesExchange, type GPTClient, type Logger, type OHLCV, type Position, type TradingPair, type BollingerBands, type OrderSide, type Repository, type TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
-import { RANGE_CONFIG, INDICATOR } from "../config/settings.js";
+import { RANGE_CONFIG, INDICATOR, RISK } from "../config/settings.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -214,9 +214,10 @@ export function createRangeBot(deps: {
   capitalUsd: number;
   repo: Repository;
   newsFetcher: NewsFetcher;
+  getDailyTrend?: (pair: TradingPair) => Promise<"buy" | "sell" | null>;
   futuresExchange?: FuturesExchange;
 }): RangeBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = RANGE_CONFIG.name;
 
   /** RSI neutral zone tolerance (±5 around RSI_NEUTRAL) */
@@ -244,7 +245,7 @@ export function createRangeBot(deps: {
     currentPrice: number,
   ): Promise<void> {
     // Stop-loss check
-    if (shouldStopLoss(position, currentPrice)) {
+    if (shouldStopLoss(position, currentPrice, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
       logger.warn(BOT_NAME, `Stop-loss triggered for ${pair}`, {
         entryPrice: position.entryPrice,
         currentPrice,
@@ -340,6 +341,15 @@ export function createRangeBot(deps: {
       return;
     }
 
+    // 日足トレンドフィルター
+    if (getDailyTrend) {
+      const allowed = await getDailyTrend(pair);
+      if (allowed && allowed !== side) {
+        logger.info(BOT_NAME, `Daily trend filter: ${side} blocked on ${pair}`);
+        return;
+      }
+    }
+
     // ── 参考指標（3つ中2つ以上で実行） ──
 
     const supplementary: { name: string; passed: boolean }[] = [];
@@ -352,38 +362,12 @@ export function createRangeBot(deps: {
     const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
     supplementary.push({ name: "adx_range", passed: adx <= INDICATOR.ADX_TREND_THRESHOLD });
 
-    // S3. GPTニュースフィルター
-    let gptOk = false;
-    try {
-      const recentNews = await newsFetcher.fetchNews(pair);
-      const filterResult = await gpt.filterNewsSignal(
-        pair,
-        side.toUpperCase(),
-        recentNews,
-      );
-      logger.info(
-        BOT_NAME,
-        `GPT news filter for ${pair}: safe=${String(filterResult.safe)}`,
-        { reasoning: filterResult.reasoning },
-      );
-
-      // Record signal in DB
-      void repo.insertSignal({
-        bot_name: BOT_NAME,
-        symbol: pair,
-        signal: `${side.toUpperCase()}_FILTER:${filterResult.safe ? "SAFE" : "BLOCKED"}`,
-        reasoning: filterResult.reasoning,
-      }).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(BOT_NAME, "Failed to record signal", { error: msg });
-      });
-
-      gptOk = filterResult.safe;
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `GPT news filter failed for ${pair}`, { error: message });
+    // S3. Polymarket確率フィルター（GPTの代わりにPolymarketの確率で判定、トークンコスト0）
+    const polymarketContradicts = newsFetcher.isPolymarketContradicting(pair, side);
+    if (polymarketContradicts) {
+      logger.info(BOT_NAME, `Polymarket contradicts ${side} on ${pair}`);
     }
-    supplementary.push({ name: "gpt_news", passed: gptOk });
+    supplementary.push({ name: "polymarket_safe", passed: !polymarketContradicts });
 
     const passedCount = supplementary.filter((s) => s.passed).length;
     const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
@@ -584,7 +568,7 @@ export function createRangeBot(deps: {
       for (const position of [...positions]) {
         try {
           const ticker = await exchange.fetchTicker(position.pair);
-          if (shouldStopLoss(position, ticker.last)) {
+          if (shouldStopLoss(position, ticker.last, undefined, RISK.STOP_LOSS_PCT_SHORT_TERM)) {
             logger.warn(BOT_NAME, `[rapid-check] Stop-loss triggered for ${position.pair} (${position.side})`, {
               entryPrice: position.entryPrice,
               currentPrice: ticker.last,
