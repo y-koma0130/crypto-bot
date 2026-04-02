@@ -20,13 +20,47 @@ const POLYMARKET_GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "stablecoin"]
 /** 全ペアに共通するキーワード（市場全体に影響するニュース） */
 const GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "fed", "interest rate", "hack", "exploit"] as const;
 
+/** HALTキーワード: これらがニュースタイトルに含まれればHALT判定 */
+const HALT_KEYWORDS = ["hack", "exploit", "hacked", "stolen", "delisting", "delisted", "ban", "banned", "shutdown", "insolvent", "bankrupt"] as const;
+
+/** Polymarket質問の方向分類用キーワード */
+const BULLISH_KEYWORDS = ["above", "rise", "bull", "approve", "rally", "surge", "exceed", "reach", "high"] as const;
+const BEARISH_KEYWORDS = ["below", "drop", "crash", "ban", "fall", "decline", "dump", "low"] as const;
+
+/** 質問テキストからbullish/bearish/nullを判定。両方にマッチする場合はnull（曖昧）。 */
+function classifyQuestion(questionLower: string): "bullish" | "bearish" | null {
+  const isBullish = BULLISH_KEYWORDS.some((kw) => questionLower.includes(kw));
+  const isBearish = BEARISH_KEYWORDS.some((kw) => questionLower.includes(kw));
+  if (isBullish && isBearish) return null;
+  if (isBullish) return "bullish";
+  if (isBearish) return "bearish";
+  return null;
+}
+
 /** ニュースの鮮度（この時間以内の記事のみ対象） */
 const MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6時間
+
+export type PolymarketSentiment = "BULLISH" | "NEUTRAL" | "BEARISH" | "HALT";
+
+export interface PolymarketSignal {
+  readonly pair: TradingPair;
+  readonly question: string;
+  readonly direction: "bullish" | "bearish";
+  readonly currentPct: number;
+  readonly previousPct: number;
+  readonly changePct: number;
+}
 
 export interface NewsFetcher {
   fetchNews(pair: TradingPair): Promise<string[]>;
   /** Polymarketの確率がシグナル方向と矛盾するか判定（GPT不要のフィルター） */
   isPolymarketContradicting(pair: TradingPair, side: "buy" | "sell"): boolean;
+  /** Polymarket確率 + RSSキーワードからセンチメントを判定（GPT不要） */
+  getSentiment(pair: TradingPair): PolymarketSentiment;
+  /** ニュースキャッシュを更新する（Polymarket + RSS） */
+  refresh(): Promise<void>;
+  /** 確率が急変したPolymarketマーケットを返す（Polymarket Bot用） */
+  getPolymarketSignals(pair: TradingPair, minChangePct: number): PolymarketSignal[];
 }
 
 // ── Polymarket Gamma API ──
@@ -72,6 +106,8 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
   // Polymarket キャッシュ
   let cachedPolymarkets: PolymarketMarket[] = [];
   let polymarketLastFetchedAt = 0;
+  // 前回の確率スナップショット（question → yesPct）
+  const previousPrices = new Map<string, number>();
 
   async function refreshCache(): Promise<void> {
     const now = Date.now();
@@ -132,8 +168,27 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
         logger.warn("system", "Polymarket API returned unexpected format");
         return;
       }
+      // 前回スナップショットを保存してから更新
+      for (const m of cachedPolymarkets) {
+        try {
+          const prices: number[] = JSON.parse(m.outcomePrices) as number[];
+          const outcomes: string[] = JSON.parse(m.outcomes) as string[];
+          const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+          if (yesIdx !== -1 && prices[yesIdx] !== undefined) {
+            previousPrices.set(m.question, prices[yesIdx]);
+          }
+        } catch { /* skip */ }
+      }
+
       cachedPolymarkets = (data as PolymarketMarket[]).filter((m) => m.active && m.question);
       polymarketLastFetchedAt = now;
+
+      // 消えたマーケットのスナップショットをクリーンアップ
+      const activeQuestions = new Set(cachedPolymarkets.map((m) => m.question));
+      for (const key of previousPrices.keys()) {
+        if (!activeQuestions.has(key)) previousPrices.delete(key);
+      }
+
       logger.info("system", `Polymarket cache refreshed: ${String(cachedPolymarkets.length)} active markets`);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -183,6 +238,10 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
   }
 
   return {
+    async refresh(): Promise<void> {
+      await Promise.allSettled([refreshCache(), refreshPolymarketCache()]);
+    },
+
     async fetchNews(pair: TradingPair): Promise<string[]> {
       try {
         await Promise.allSettled([refreshCache(), refreshPolymarketCache()]);
@@ -192,6 +251,63 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
         logger.error("system", "News fetch failed", { pair, error: message });
         return [];
       }
+    },
+
+    getSentiment(pair: TradingPair): PolymarketSentiment {
+      const now = Date.now();
+      const pairKeywords = PAIR_KEYWORDS[pair];
+
+      // 1. HALTチェック: 直近ニュースにHALTキーワードがあれば即HALT
+      for (const article of cachedArticles) {
+        if (now - article.pubDate > MAX_AGE_MS) continue;
+        const titleLower = article.title.toLowerCase();
+        const matchesPair = pairKeywords.some((kw) => titleLower.includes(kw)) ||
+          GLOBAL_KEYWORDS.some((kw) => titleLower.includes(kw));
+        if (matchesPair && HALT_KEYWORDS.some((kw) => titleLower.includes(kw))) {
+          logger.warn("system", `HALT keyword detected in news: "${article.title}"`, { pair });
+          return "HALT";
+        }
+      }
+
+      // 2. Polymarket確率ベースのセンチメント判定
+      let bullishScore = 0;
+      let bearishScore = 0;
+
+      const relevant = cachedPolymarkets.filter((m) => {
+        const q = m.question.toLowerCase();
+        return pairKeywords.some((kw) => q.includes(kw));
+      });
+
+      for (const market of relevant) {
+        try {
+          const prices: number[] = JSON.parse(market.outcomePrices) as number[];
+          const outcomes: string[] = JSON.parse(market.outcomes) as string[];
+          const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+          if (yesIdx === -1 || prices[yesIdx] === undefined) continue;
+
+          const yesPct = prices[yesIdx];
+          const direction = classifyQuestion(market.question.toLowerCase());
+          if (direction === "bullish") {
+            bullishScore += yesPct;
+            bearishScore += 1 - yesPct;
+          } else if (direction === "bearish") {
+            bearishScore += yesPct;
+            bullishScore += 1 - yesPct;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      // 関連マーケットがなければNEUTRAL
+      if (relevant.length === 0) return "NEUTRAL";
+
+      const avgBullish = bullishScore / relevant.length;
+      const avgBearish = bearishScore / relevant.length;
+
+      if (avgBullish >= 0.65) return "BULLISH";
+      if (avgBearish >= 0.65) return "BEARISH";
+      return "NEUTRAL";
     },
 
     isPolymarketContradicting(pair: TradingPair, side: "buy" | "sell"): boolean {
@@ -209,23 +325,67 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
           if (yesIdx === -1 || prices[yesIdx] === undefined) continue;
 
           const yesPct = prices[yesIdx];
-          const q = market.question.toLowerCase();
-          const isBullishQuestion = q.includes("above") || q.includes("rise") || q.includes("bull") || q.includes("approve") || q.includes("rally") || q.includes("surge") || q.includes("exceed") || q.includes("reach") || q.includes("high");
-          const isBearishQuestion = q.includes("below") || q.includes("drop") || q.includes("crash") || q.includes("ban") || q.includes("fall") || q.includes("decline") || q.includes("dump") || q.includes("low");
+          const direction = classifyQuestion(market.question.toLowerCase());
+          if (!direction) continue;
 
-          // 強気の質問で60%超Yesなのにsellしようとしている → 矛盾
-          if (isBullishQuestion && yesPct > 0.6 && side === "sell") return true;
-          // 弱気の質問で60%超Yesなのにbuyしようとしている → 矛盾
-          if (isBearishQuestion && yesPct > 0.6 && side === "buy") return true;
-          // 強気の質問で60%超Noなのにbuyしようとしている → 矛盾
-          if (isBullishQuestion && yesPct < 0.4 && side === "buy") return true;
-          // 弱気の質問で60%超Noなのにsellしようとしている → 矛盾
-          if (isBearishQuestion && yesPct < 0.4 && side === "sell") return true;
+          if (direction === "bullish" && yesPct > 0.6 && side === "sell") return true;
+          if (direction === "bearish" && yesPct > 0.6 && side === "buy") return true;
+          if (direction === "bullish" && yesPct < 0.4 && side === "buy") return true;
+          if (direction === "bearish" && yesPct < 0.4 && side === "sell") return true;
         } catch {
           continue;
         }
       }
       return false;
+    },
+
+    getPolymarketSignals(pair: TradingPair, minChangePct: number): PolymarketSignal[] {
+      const pairKeywords = PAIR_KEYWORDS[pair];
+      const signals: PolymarketSignal[] = [];
+
+      const relevant = cachedPolymarkets.filter((m) => {
+        const q = m.question.toLowerCase();
+        return pairKeywords.some((kw) => q.includes(kw));
+      });
+
+      for (const market of relevant) {
+        try {
+          const prices: number[] = JSON.parse(market.outcomePrices) as number[];
+          const outcomes: string[] = JSON.parse(market.outcomes) as string[];
+          const yesIdx = outcomes.findIndex((o) => o.toLowerCase() === "yes");
+          if (yesIdx === -1 || prices[yesIdx] === undefined) continue;
+
+          const currentPct = prices[yesIdx];
+          const prevPct = previousPrices.get(market.question);
+          if (prevPct === undefined) continue;
+
+          const changePct = currentPct - prevPct;
+          if (Math.abs(changePct) < minChangePct) continue;
+
+          const qDirection = classifyQuestion(market.question.toLowerCase());
+          if (!qDirection) continue;
+
+          let direction: "bullish" | "bearish";
+          if (qDirection === "bullish") {
+            direction = changePct > 0 ? "bullish" : "bearish";
+          } else {
+            direction = changePct > 0 ? "bearish" : "bullish";
+          }
+
+          signals.push({
+            pair,
+            question: market.question,
+            direction,
+            currentPct,
+            previousPct: prevPct,
+            changePct,
+          });
+        } catch {
+          continue;
+        }
+      }
+
+      return signals;
     },
   };
 }

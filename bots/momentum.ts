@@ -18,6 +18,7 @@ import {
   calculatePnl,
   calculateATR,
   shouldStopLoss,
+  shouldPartialTakeProfit,
   canOpenPosition,
   isVolatilityExpanding,
 } from "../core/risk.js";
@@ -205,6 +206,24 @@ export function createMomentumBot(deps: {
       });
       await closePosition(pair, position, "stop-loss");
       return;
+    }
+
+    // 部分利確: +2%で半分決済
+    if (shouldPartialTakeProfit(position, currentPrice)) {
+      const halfAmount = position.amount / 2;
+      const client = getOrderClient(position.side, exchange, futuresExchange);
+      const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
+      try {
+        await client.createOrder({ pair, side: closeSide, amount: halfAmount });
+        position.amount -= halfAmount;
+        position.partialTaken = true;
+        logger.info(BOT_NAME, `Partial take-profit on ${pair}: closed half at ${String(currentPrice)}`, {
+          remainingAmount: position.amount,
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(BOT_NAME, `Failed partial take-profit on ${pair}`, { error: message });
+      }
     }
 
     // ロング: EMAクロスアンダーで決済

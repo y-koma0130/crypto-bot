@@ -57,15 +57,17 @@ export interface Position {
   readonly pair: TradingPair;
   readonly side: OrderSide;
   readonly entryPrice: number;
-  readonly amount: number;
+  amount: number;
   readonly openedAt: number;
   /** トレーリングストップ用: ポジション保有中の最高/最低到達価格 */
   highWaterMark: number;
+  /** 部分利確済みフラグ */
+  partialTaken?: boolean;
 }
 
 // ── ボット ──
 
-export type BotName = "momentum" | "momentum-fast" | "range" | "sentiment";
+export type BotName = "momentum" | "momentum-fast" | "range" | "sentiment" | "polymarket";
 
 export interface BotConfig {
   readonly name: BotName;

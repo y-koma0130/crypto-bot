@@ -71,11 +71,18 @@ export const RANGE_CONFIG: BotConfig = {
   capitalRatio: 0.35,
 } as const;
 
+export const POLYMARKET_BOT_CONFIG: BotConfig = {
+  name: "polymarket",
+  pairs: ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"],
+  timeframe: "15m",
+  capitalRatio: 0.05,
+} as const;
+
 export const SENTIMENT_CONFIG: BotConfig = {
   name: "sentiment",
   pairs: ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"],
   timeframe: "1h",
-  capitalRatio: 0.25,
+  capitalRatio: 0.2,
 } as const;
 
 // ── リスク管理定数 ──
@@ -88,7 +95,7 @@ export const RISK = {
   /** 各ボット最大同時ポジション数 */
   MAX_POSITIONS_PER_BOT: 1,
   /** ボット合計最大同時ポジション数 */
-  MAX_TOTAL_POSITIONS: 4,
+  MAX_TOTAL_POSITIONS: 5,
   /** 日次損失上限（-10%） */
   DAILY_LOSS_LIMIT_PCT: -0.10,
   /** KuCoin取引手数料（0.1%） */
@@ -107,10 +114,18 @@ export const RISK = {
   RISK_PER_TRADE_PCT: 0.01,
   /** 同方向ポジション上限 */
   MAX_SAME_DIRECTION: 2,
+  /** 部分利確: この含み益で半分決済 */
+  PARTIAL_TAKE_PROFIT_PCT: 0.02,
   /** 日足トレンドフィルター用EMA期間 */
   DAILY_TREND_EMA_PERIOD: 20,
   /** 連敗制御: この回数連続で負けたら次のtickをスキップ */
   MAX_CONSECUTIVE_LOSSES: 3,
+  /** 相関フィルター: BTCの直近1h変動がこれ以下ならアルトのロングをブロック */
+  BTC_CRASH_THRESHOLD_PCT: -0.02,
+  /** 時間ベース損切り: この時間（ms）経過で利益未達なら決済（Momentum Fast用） */
+  TIME_STOP_MS: 4 * 60 * 60 * 1000,
+  /** 時間ベース損切りの最低利益率 */
+  TIME_STOP_MIN_PROFIT_PCT: 0.01,
 } as const;
 
 // ── テクニカル指標パラメータ ──

@@ -1,8 +1,8 @@
 import {
   getOrderClient,
-  type Exchange, type FuturesExchange, type GPTClient, type Logger, type Position, type SentimentResult, type TradingPair, type Repository, type TradeRecord,
+  type Exchange, type FuturesExchange, type Logger, type Position, type SentimentResult, type TradingPair, type Repository, type TradeRecord,
 } from "../types/index.js";
-import type { NewsFetcher } from "../core/news.js";
+import type { NewsFetcher, PolymarketSentiment } from "../core/news.js";
 import { calculateEMA } from "./momentum.js";
 import { SENTIMENT_CONFIG } from "../config/settings.js";
 import {
@@ -27,7 +27,6 @@ export interface SentimentBot {
 
 interface SentimentBotDeps {
   readonly exchange: Exchange;
-  readonly gpt: GPTClient;
   readonly logger: Logger;
   readonly capitalUsd: number;
   readonly repo: Repository;
@@ -39,7 +38,7 @@ interface SentimentBotDeps {
 // ── Factory ──
 
 export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
+  const { exchange, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = SENTIMENT_CONFIG.name;
 
   let positions: Position[] = [];
@@ -55,45 +54,45 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
   // ── Core tick logic ──
 
+  /** PolymarketSentiment → SentimentResult に変換 */
+  function toSentimentResult(level: PolymarketSentiment, pair: TradingPair): SentimentResult {
+    return {
+      level,
+      reasoning: `Polymarket-based sentiment for ${pair}`,
+      timestamp: Date.now(),
+    };
+  }
+
   async function tick(allPositions: readonly Position[]): Promise<void> {
     logger.info(BOT_NAME, "Sentiment tick started");
 
-    // Phase 1: Fetch news for all pairs, then batch-analyze in 1 GPT call
-    const newsResults = await Promise.all(
-      SENTIMENT_CONFIG.pairs.map((pair) => newsFetcher.fetchNews(pair)),
-    );
-    const pairNewsMap = new Map<TradingPair, string[]>(
-      SENTIMENT_CONFIG.pairs.map((pair, i) => [pair, newsResults[i] ?? []]),
-    );
+    // Phase 1: Polymarket + RSSキーワードベースのセンチメント判定（GPT不要）
+    await newsFetcher.refresh();
 
-    try {
-      const results = await gpt.analyzeSentimentBatch(pairNewsMap);
-      for (const [pair, result] of results) {
-        sentimentMap.set(pair, result);
+    for (const pair of SENTIMENT_CONFIG.pairs) {
+      const level = newsFetcher.getSentiment(pair);
+      const result = toSentimentResult(level, pair);
+      sentimentMap.set(pair, result);
 
-        logger.info(BOT_NAME, `Sentiment for ${pair}: ${result.level}`, {
+      logger.info(BOT_NAME, `Sentiment for ${pair}: ${result.level}`, {
+        reasoning: result.reasoning,
+      });
+
+      void repo.insertSignal({
+        bot_name: BOT_NAME,
+        symbol: pair,
+        signal: result.level,
+        reasoning: result.reasoning,
+      }).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(BOT_NAME, "Failed to record signal", { error: msg });
+      });
+
+      if (result.level === "HALT") {
+        logger.warn(BOT_NAME, `HALT detected on ${pair} — blocking new entries for all bots`, {
           reasoning: result.reasoning,
         });
-
-        void repo.insertSignal({
-          bot_name: BOT_NAME,
-          symbol: pair,
-          signal: result.level,
-          reasoning: result.reasoning,
-        }).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error(BOT_NAME, "Failed to record signal", { error: msg });
-        });
-
-        if (result.level === "HALT") {
-          logger.warn(BOT_NAME, `HALT detected on ${pair} — blocking new entries for all bots`, {
-            reasoning: result.reasoning,
-          });
-        }
       }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error(BOT_NAME, "Batch sentiment analysis failed", { error: message });
     }
 
     // Phase 2: Manage existing positions (stop-loss check)

@@ -215,6 +215,23 @@ export function calculatePnl(params: {
 }
 
 /**
+ * 部分利確が必要か判定する。
+ * 含み益が PARTIAL_TAKE_PROFIT_PCT 以上で、まだ部分利確していなければ true。
+ */
+export function shouldPartialTakeProfit(
+  position: Position,
+  currentPrice: number,
+): boolean {
+  if (position.partialTaken) return false;
+
+  const unrealizedPct = position.side === "buy"
+    ? (currentPrice - position.entryPrice) / position.entryPrice
+    : (position.entryPrice - currentPrice) / position.entryPrice;
+
+  return unrealizedPct >= RISK.PARTIAL_TAKE_PROFIT_PCT;
+}
+
+/**
  * 日足EMAに基づいて許可されるトレード方向を判定する。
  * 価格がEMA上 → ロングのみ許可、EMA下 → ショートのみ許可。
  */

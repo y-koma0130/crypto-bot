@@ -9,6 +9,7 @@ import { createMomentumBot } from "./bots/momentum.js";
 import { createMomentumFastBot } from "./bots/momentum-fast.js";
 import { createRangeBot } from "./bots/range.js";
 import { createSentimentBot } from "./bots/sentiment.js";
+import { createPolymarketBot } from "./bots/polymarket.js";
 import { isDailyLossLimitReached, getAllowedSide, countConsecutiveLosses } from "./core/risk.js";
 import { RISK } from "./config/settings.js";
 import type { BotName, OrderSide, Position, TradingPair } from "./types/index.js";
@@ -36,6 +37,7 @@ async function main(): Promise<void> {
   const sentimentMutex = createMutex();
   const momentumMutex = createMutex();
   const momentumFastMutex = createMutex();
+  const polymarketMutex = createMutex();
   const rangeMutex = createMutex();
   // stopLossMutex は不要 — 各ボットのmutex内で実行して競合を防ぐ
 
@@ -59,7 +61,6 @@ async function main(): Promise<void> {
 
   const sentimentBot = createSentimentBot({
     exchange,
-    gpt,
     logger,
     capitalUsd: config.totalCapital,
     repo,
@@ -91,6 +92,17 @@ async function main(): Promise<void> {
   const rangeBot = createRangeBot({
     exchange,
     gpt,
+    logger,
+    capitalUsd: config.totalCapital,
+    repo,
+    newsFetcher,
+    futuresExchange,
+    getDailyTrend: getDailyTrendProxy,
+    isBtcCrashing: () => isBtcCrashing(),
+  });
+
+  const polymarketBot = createPolymarketBot({
+    exchange,
     logger,
     capitalUsd: config.totalCapital,
     repo,
@@ -174,11 +186,39 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── 相関フィルター: BTC急落時はアルトのロングをブロック ──
+  let btcCrashCache: { value: boolean; expiresAt: number } = { value: false, expiresAt: 0 };
+
+  async function isBtcCrashing(): Promise<boolean> {
+    const now = Date.now();
+    if (now < btcCrashCache.expiresAt) return btcCrashCache.value;
+
+    try {
+      // fetchOHLCVは未確定足を除外済み。直近2本の確定足を比較
+      const candles = await exchange.fetchOHLCV("BTC/USDT", "1h", 3);
+      if (candles.length >= 2) {
+        const prev = candles[candles.length - 2]!.close;
+        const curr = candles[candles.length - 1]!.close;
+        const changePct = (curr - prev) / prev;
+        const crashing = changePct <= RISK.BTC_CRASH_THRESHOLD_PCT;
+        btcCrashCache = { value: crashing, expiresAt: now + 5 * 60_000 };
+        if (crashing) {
+          logger.warn("system", `BTC crash detected (${(changePct * 100).toFixed(2)}%) — blocking alt longs`);
+        }
+        return crashing;
+      }
+    } catch {
+      // フィルターを適用しない
+    }
+    return false;
+  }
+
   function getAllPositions(): readonly Position[] {
     return [
       ...sentimentBot.getPositions(),
       ...momentumBot.getPositions(),
       ...momentumFastBot.getPositions(),
+      ...polymarketBot.getPositions(),
       ...rangeBot.getPositions(),
     ];
   }
@@ -262,11 +302,26 @@ async function main(): Promise<void> {
     }
   }
 
+  async function tickPolymarket(): Promise<void> {
+    if (shuttingDown) return;
+    if (sentimentBot.isHalted()) { logger.warn("polymarket", "Skipping tick — HALT active"); return; }
+    if (await checkDailyLossLimit()) { logger.warn("polymarket", "Skipping tick — daily loss limit reached"); return; }
+    if (await isOnLosingStreak("polymarket")) return;
+    try {
+      await polymarketBot.tick(getAllPositions());
+      updateBotStatus("polymarket", polymarketBot.getPositions());
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("polymarket", `Polymarket tick failed: ${message}`);
+    }
+  }
+
   async function tickRange(): Promise<void> {
     if (shuttingDown) return;
     if (sentimentBot.isHalted()) { logger.warn("range", "Skipping tick — HALT active"); return; }
     if (await checkDailyLossLimit()) { logger.warn("range", "Skipping tick — daily loss limit reached"); return; }
     if (await isOnLosingStreak("range")) return;
+    // 相関フィルターはtick内の日足トレンドフィルターで処理（ショートは許可する）
     try {
       await rangeBot.tick(getAllPositions());
       updateBotStatus("range", rangeBot.getPositions());
@@ -285,6 +340,7 @@ async function main(): Promise<void> {
     await Promise.all([
       momentumMutex.run(() => momentumBot.checkStopLosses()),
       momentumFastMutex.run(() => momentumFastBot.checkStopLosses()),
+      polymarketMutex.run(() => polymarketBot.checkStopLosses()),
       rangeMutex.run(() => rangeBot.checkStopLosses()),
       sentimentMutex.run(() => sentimentBot.checkStopLosses()),
     ]);
@@ -299,6 +355,9 @@ async function main(): Promise<void> {
 
   // Bot1-fast（短期モメンタム）: 15分毎（15m足ベース）
   const cronMomentumFast = cron.schedule("*/15 * * * *", () => void momentumFastMutex.run(tickMomentumFast));
+
+  // Polymarket Bot: 10分毎（確率変化を監視）
+  const cronPolymarket = cron.schedule("*/10 * * * *", () => void polymarketMutex.run(tickPolymarket));
 
   // Bot2（レンジ）: 15分毎（15m足ベース）
   const cronRange = cron.schedule("*/15 * * * *", () => void rangeMutex.run(tickRange));
@@ -316,6 +375,7 @@ async function main(): Promise<void> {
     cronSentiment.stop();
     cronMomentum.stop();
     cronMomentumFast.stop();
+    cronPolymarket.stop();
     cronRange.stop();
     cronStopLoss.stop();
     logger.info("system", "Cron jobs stopped");
@@ -325,6 +385,7 @@ async function main(): Promise<void> {
       repo.updateBotStatus({ bot_name: "sentiment", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
       repo.updateBotStatus({ bot_name: "momentum", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
       repo.updateBotStatus({ bot_name: "momentum-fast", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
+      repo.updateBotStatus({ bot_name: "polymarket", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
       repo.updateBotStatus({ bot_name: "range", is_active: false, is_halted: false, last_run_at: new Date().toISOString(), current_position: null }),
     ]);
     logger.info("system", "Bot status updated to inactive");
@@ -337,15 +398,17 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
   // ── 起動時にDBからポジション復元 ──
-  const [sentimentTrades, momentumTrades, momentumFastTrades, rangeTrades] = await Promise.all([
+  const [sentimentTrades, momentumTrades, momentumFastTrades, polymarketTrades, rangeTrades] = await Promise.all([
     repo.findOpenTrades("sentiment"),
     repo.findOpenTrades("momentum"),
     repo.findOpenTrades("momentum-fast"),
+    repo.findOpenTrades("polymarket"),
     repo.findOpenTrades("range"),
   ]);
   sentimentBot.restorePositions(sentimentTrades);
   momentumBot.restorePositions(momentumTrades);
   momentumFastBot.restorePositions(momentumFastTrades);
+  polymarketBot.restorePositions(polymarketTrades);
   rangeBot.restorePositions(rangeTrades);
 
   logger.info("system", "All cron jobs scheduled. Bot is running.");
@@ -358,6 +421,7 @@ async function main(): Promise<void> {
   await Promise.all([
     momentumMutex.run(tickMomentum),
     momentumFastMutex.run(tickMomentumFast),
+    polymarketMutex.run(tickPolymarket),
     rangeMutex.run(tickRange),
   ]);
 

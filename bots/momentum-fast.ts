@@ -22,6 +22,7 @@ import {
   calculatePnl,
   calculateATR,
   shouldStopLoss,
+  shouldPartialTakeProfit,
   canOpenPosition,
   isVolatilityExpanding,
 } from "../core/risk.js";
@@ -74,6 +75,35 @@ export function createMomentumFastBot(deps: {
       });
       await closePosition(pair, position, "stop-loss");
       return;
+    }
+
+    // 時間ベース損切り: 4時間経過で+1%未達なら決済
+    const elapsed = Date.now() - position.openedAt;
+    if (elapsed >= RISK.TIME_STOP_MS) {
+      const unrealizedPct = position.side === "buy"
+        ? (currentPrice - position.entryPrice) / position.entryPrice
+        : (position.entryPrice - currentPrice) / position.entryPrice;
+      if (unrealizedPct < RISK.TIME_STOP_MIN_PROFIT_PCT) {
+        logger.info(BOT_NAME, `Time stop on ${pair}: ${(elapsed / 3_600_000).toFixed(1)}h elapsed, profit ${(unrealizedPct * 100).toFixed(2)}%`);
+        await closePosition(pair, position, "time-stop");
+        return;
+      }
+    }
+
+    // 部分利確
+    if (shouldPartialTakeProfit(position, currentPrice)) {
+      const halfAmount = position.amount / 2;
+      const client = getOrderClient(position.side, exchange, futuresExchange);
+      const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
+      try {
+        await client.createOrder({ pair, side: closeSide, amount: halfAmount });
+        position.amount -= halfAmount;
+        position.partialTaken = true;
+        logger.info(BOT_NAME, `Partial take-profit on ${pair}: closed half`, { remainingAmount: position.amount });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(BOT_NAME, `Failed partial take-profit on ${pair}`, { error: message });
+      }
     }
 
     if (position.side === "buy" && signal.crossUnder) {

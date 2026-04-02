@@ -8,6 +8,7 @@ import {
   calculatePositionSize,
   calculatePnl,
   shouldStopLoss,
+  shouldPartialTakeProfit,
   canOpenPosition,
 } from "../core/risk.js";
 
@@ -215,9 +216,10 @@ export function createRangeBot(deps: {
   repo: Repository;
   newsFetcher: NewsFetcher;
   getDailyTrend?: (pair: TradingPair) => Promise<"buy" | "sell" | null>;
+  isBtcCrashing?: () => Promise<boolean>;
   futuresExchange?: FuturesExchange;
 }): RangeBot {
-  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend, isBtcCrashing } = deps;
   const BOT_NAME = RANGE_CONFIG.name;
 
   /** RSI neutral zone tolerance (±5 around RSI_NEUTRAL) */
@@ -252,6 +254,22 @@ export function createRangeBot(deps: {
       });
       await closePosition(pair, position, currentPrice, "stop-loss");
       return;
+    }
+
+    // 部分利確
+    if (shouldPartialTakeProfit(position, currentPrice)) {
+      const halfAmount = position.amount / 2;
+      const closeSide = position.side === "buy" ? "sell" as const : "buy" as const;
+      const client = getOrderClient(position.side, exchange, futuresExchange);
+      try {
+        await client.createOrder({ pair, side: closeSide, amount: halfAmount });
+        position.amount -= halfAmount;
+        position.partialTaken = true;
+        logger.info(BOT_NAME, `Partial take-profit on ${pair}: closed half`, { remainingAmount: position.amount });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(BOT_NAME, `Failed partial take-profit on ${pair}`, { error: message });
+      }
     }
 
     // RSI returns to neutral zone (within ±5 of 50)
@@ -346,6 +364,14 @@ export function createRangeBot(deps: {
       const allowed = await getDailyTrend(pair);
       if (allowed && allowed !== side) {
         logger.info(BOT_NAME, `Daily trend filter: ${side} blocked on ${pair}`);
+        return;
+      }
+    }
+
+    // 相関フィルター: BTC急落時はアルトのロングのみブロック（ショートは許可）
+    if (side === "buy" && isBtcCrashing) {
+      if (await isBtcCrashing()) {
+        logger.warn(BOT_NAME, `BTC crash detected — blocking buy on ${pair}`);
         return;
       }
     }
