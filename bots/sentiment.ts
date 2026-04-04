@@ -1,6 +1,6 @@
 import {
   getOrderClient,
-  type Exchange, type FuturesExchange, type Logger, type Position, type SentimentResult, type TradingPair, type Repository, type TradeRecord,
+  type Exchange, type FuturesExchange, type GPTClient, type Logger, type Position, type SentimentResult, type TradingPair, type Repository, type TradeRecord,
 } from "../types/index.js";
 import type { NewsFetcher, PolymarketSentiment } from "../core/news.js";
 import { calculateEMA } from "./momentum.js";
@@ -27,6 +27,7 @@ export interface SentimentBot {
 
 interface SentimentBotDeps {
   readonly exchange: Exchange;
+  readonly gpt: GPTClient;
   readonly logger: Logger;
   readonly capitalUsd: number;
   readonly repo: Repository;
@@ -38,7 +39,7 @@ interface SentimentBotDeps {
 // ── Factory ──
 
 export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
-  const { exchange, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
+  const { exchange, gpt, logger, capitalUsd, repo, newsFetcher, futuresExchange, getDailyTrend } = deps;
   const BOT_NAME = SENTIMENT_CONFIG.name;
 
   let positions: Position[] = [];
@@ -54,11 +55,11 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
   // ── Core tick logic ──
 
-  /** PolymarketSentiment → SentimentResult に変換 */
+  /** PolymarketSentiment → SentimentResult に変換（フォールバック用） */
   function toSentimentResult(level: PolymarketSentiment, pair: TradingPair): SentimentResult {
     return {
       level,
-      reasoning: `Polymarket-based sentiment for ${pair}`,
+      reasoning: `Keyword-based fallback for ${pair}`,
       timestamp: Date.now(),
     };
   }
@@ -66,31 +67,99 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
   async function tick(allPositions: readonly Position[]): Promise<void> {
     logger.info(BOT_NAME, "Sentiment tick started");
 
-    // Phase 1: Polymarket + RSSキーワードベースのセンチメント判定（GPT不要）
+    // Phase 1: ニュースデータ取得 + GPTセンチメント分析
     await newsFetcher.refresh();
 
+    // 1a. キーワードHALTの即時チェック（GPT待ち不要で緊急停止）
+    let haltDetected = false;
     for (const pair of SENTIMENT_CONFIG.pairs) {
-      const level = newsFetcher.getSentiment(pair);
-      const result = toSentimentResult(level, pair);
-      sentimentMap.set(pair, result);
-
-      logger.info(BOT_NAME, `Sentiment for ${pair}: ${result.level}`, {
-        reasoning: result.reasoning,
-      });
-
-      void repo.insertSignal({
-        bot_name: BOT_NAME,
-        symbol: pair,
-        signal: result.level,
-        reasoning: result.reasoning,
-      }).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(BOT_NAME, "Failed to record signal", { error: msg });
-      });
-
-      if (result.level === "HALT") {
+      const keywordLevel = newsFetcher.getSentiment(pair);
+      if (keywordLevel === "HALT") {
+        const haltResult: SentimentResult = {
+          level: "HALT",
+          reasoning: `Emergency keyword HALT detected for ${pair}`,
+          timestamp: Date.now(),
+        };
+        sentimentMap.set(pair, haltResult);
+        haltDetected = true;
         logger.warn(BOT_NAME, `HALT detected on ${pair} — blocking new entries for all bots`, {
+          reasoning: haltResult.reasoning,
+        });
+        void repo.insertSignal({
+          bot_name: BOT_NAME,
+          symbol: pair,
+          signal: "HALT",
+          reasoning: haltResult.reasoning,
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error(BOT_NAME, "Failed to record signal", { error: msg });
+        });
+      }
+    }
+
+    // 1b. HALT以外のペアはGPTでセンチメント分析
+    const nonHaltPairs = SENTIMENT_CONFIG.pairs.filter(
+      (pair) => sentimentMap.get(pair)?.level !== "HALT",
+    );
+
+    if (nonHaltPairs.length > 0) {
+      // 各ペアのニュース（Polymarket + RSS）を収集
+      const pairNewsMap = new Map<TradingPair, string[]>();
+      for (const pair of nonHaltPairs) {
+        const news = await newsFetcher.fetchNews(pair);
+        pairNewsMap.set(pair, news);
+      }
+
+      // GPTバッチ分析を試行、失敗時はキーワードフォールバック
+      let gptResults: Map<TradingPair, SentimentResult> | null = null;
+      try {
+        gptResults = await gpt.analyzeSentimentBatch(pairNewsMap);
+        logger.info(BOT_NAME, "GPT sentiment analysis completed", {
+          pairs: nonHaltPairs,
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(BOT_NAME, `GPT sentiment analysis failed, falling back to keyword-based`, { error: message });
+      }
+
+      for (const pair of nonHaltPairs) {
+        let result: SentimentResult;
+
+        if (gptResults) {
+          const gptResult = gptResults.get(pair);
+          if (gptResult) {
+            result = gptResult;
+          } else {
+            // GPT結果にペアがない場合はフォールバック
+            const level = newsFetcher.getSentiment(pair);
+            result = toSentimentResult(level, pair);
+          }
+        } else {
+          // GPT全体失敗時はキーワードフォールバック
+          const level = newsFetcher.getSentiment(pair);
+          result = toSentimentResult(level, pair);
+        }
+
+        // GPTがHALTを返した場合も尊重
+        if (result.level === "HALT") {
+          haltDetected = true;
+          logger.warn(BOT_NAME, `GPT HALT detected on ${pair}`, { reasoning: result.reasoning });
+        }
+
+        sentimentMap.set(pair, result);
+
+        logger.info(BOT_NAME, `Sentiment for ${pair}: ${result.level}`, {
           reasoning: result.reasoning,
+        });
+
+        void repo.insertSignal({
+          bot_name: BOT_NAME,
+          symbol: pair,
+          signal: result.level,
+          reasoning: result.reasoning,
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error(BOT_NAME, "Failed to record signal", { error: msg });
         });
       }
     }

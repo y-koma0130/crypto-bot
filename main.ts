@@ -61,6 +61,7 @@ async function main(): Promise<void> {
 
   const sentimentBot = createSentimentBot({
     exchange,
+    gpt,
     logger,
     capitalUsd: config.totalCapital,
     repo,
