@@ -158,7 +158,7 @@ export const RISK = {
   /** 1トレードあたりのリスク = 資本の1% */
   RISK_PER_TRADE_PCT: 0.01,
   /** 同方向ポジション上限 */
-  MAX_SAME_DIRECTION: 2,
+  MAX_SAME_DIRECTION: 3,
   /** 日足トレンドフィルター用EMA期間 */
   DAILY_TREND_EMA_PERIOD: 20,
   /** 連敗制御: この回数連続で負けたら次のtickをスキップ */

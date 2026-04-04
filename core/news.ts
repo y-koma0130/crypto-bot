@@ -20,8 +20,8 @@ const POLYMARKET_GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "stablecoin"]
 /** 全ペアに共通するキーワード（市場全体に影響するニュース） */
 const GLOBAL_KEYWORDS = ["crypto", "sec", "regulation", "fed", "interest rate", "hack", "exploit"] as const;
 
-/** HALTキーワード: これらがニュースタイトルに含まれればHALT判定 */
-const HALT_KEYWORDS = ["hack", "exploit", "hacked", "stolen", "delisting", "delisted", "ban", "banned", "shutdown", "insolvent", "bankrupt"] as const;
+/** HALTキーワード: 本当の緊急事態のみ（規制ニュースは日常的なので除外） */
+const HALT_KEYWORDS = ["hack", "exploit", "hacked", "stolen", "delisting", "delisted", "shutdown", "insolvent", "bankrupt"] as const;
 
 /** Polymarket質問の方向分類用キーワード */
 const BULLISH_KEYWORDS = ["above", "rise", "bull", "approve", "rally", "surge", "exceed", "reach", "high"] as const;
@@ -305,8 +305,8 @@ export function createNewsFetcher(logger: Logger): NewsFetcher {
       const avgBullish = bullishScore / relevant.length;
       const avgBearish = bearishScore / relevant.length;
 
-      if (avgBullish >= 0.65) return "BULLISH";
-      if (avgBearish >= 0.65) return "BEARISH";
+      if (avgBullish >= 0.55) return "BULLISH";
+      if (avgBearish >= 0.55) return "BEARISH";
       return "NEUTRAL";
     },
 
