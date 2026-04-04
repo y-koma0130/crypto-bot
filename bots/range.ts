@@ -392,9 +392,24 @@ export function createRangeBot(deps: {
     const bbWidth = calculateBBWidth(bb);
     supplementary.push({ name: "bb_squeeze", passed: bbWidth <= INDICATOR.BB_SQUEEZE_THRESHOLD });
 
-    // S2. ADXトレンドフィルター
-    const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
-    supplementary.push({ name: "adx_range", passed: adx <= INDICATOR.ADX_TREND_THRESHOLD });
+    // S2. マーケットレジーム判定（GPT分類 → ADXフォールバック）
+    let regimeRanging = false;
+    try {
+      const regimeResult = await gpt.classifyMarketRegime(pair, [...candles]);
+      regimeRanging = regimeResult.regime === "RANGING" && regimeResult.confidence >= 0.6;
+      logger.debug(BOT_NAME, `GPT regime for ${pair}: ${regimeResult.regime} (confidence: ${regimeResult.confidence.toFixed(2)})`, {
+        regime: regimeResult.regime,
+        confidence: regimeResult.confidence,
+        reasoning: regimeResult.reasoning,
+      });
+    } catch (err: unknown) {
+      // GPT失敗時はADXフォールバック
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(BOT_NAME, `GPT regime classification failed, falling back to ADX`, { error: message });
+      const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
+      regimeRanging = adx <= INDICATOR.ADX_TREND_THRESHOLD;
+    }
+    supplementary.push({ name: "regime_ranging", passed: regimeRanging });
 
     // S3. Polymarket確率フィルター（GPTの代わりにPolymarketの確率で判定、トークンコスト0）
     const polymarketContradicts = newsFetcher.isPolymarketContradicting(pair, side);

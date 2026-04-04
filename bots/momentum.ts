@@ -24,7 +24,7 @@ import {
 } from "../core/risk.js";
 
 // Re-export from shared module for backward compatibility
-import { calculateEMA } from "../core/indicators.js";
+import { calculateEMA, calculateMTFScore, analyzeVolume } from "../core/indicators.js";
 export { calculateEMA };
 
 // ── MACD calculation (pure function, exported for testing) ──
@@ -309,39 +309,43 @@ export function createMomentumBot(deps: {
     pair: TradingPair,
     confirmedCandles: readonly OHLCV[],
     direction: EntryDirection,
-  ): Promise<{ passed: boolean; passedCount: number }> {
+  ): Promise<{ passed: boolean; passedCount: number; mtfScore: number }> {
     const supplementary: { name: string; passed: boolean }[] = [];
 
-    // S1. 出来高確認
-    supplementary.push({ name: "volume", passed: isVolumeConfirmed(confirmedCandles) });
+    // S1. 出来高加重分析（トレンド・パターンを加味したスコアリング）
+    const volAnalysis = analyzeVolume(confirmedCandles, INDICATOR.VOLUME_LOOKBACK, INDICATOR.VOLUME_MULTIPLIER);
+    // スコア 0.5 以上で通過（sustained + increasing = 1.0、spike のみ = 0.5）
+    supplementary.push({ name: "volume_weighted", passed: volAnalysis.score >= 0.5 });
+    logger.debug(BOT_NAME, `Volume analysis for ${pair}: score=${volAnalysis.score.toFixed(2)}, trend=${volAnalysis.trend}, pattern=${volAnalysis.pattern}`);
 
     // S2. ATRボラティリティ拡大
     supplementary.push({ name: "atr", passed: isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD) });
 
-    // S3. 4h EMA(50) トレンド確認（ロング: 価格≥EMA / ショート: 価格<EMA）
-    let mtfOk = false;
-    try {
-      const candles4h = await exchange.fetchOHLCV(pair, "4h", 55);
-      if (candles4h.length >= 50) {
-        const ema4h = calculateEMA(candles4h, 50);
-        const latestEma4h = ema4h[ema4h.length - 1];
-        const latest4hClose = candles4h[candles4h.length - 1]?.close;
-        if (latestEma4h !== undefined && !Number.isNaN(latestEma4h) && latest4hClose !== undefined) {
-          mtfOk = direction === "long"
-            ? latest4hClose >= latestEma4h
-            : latest4hClose < latestEma4h;
-        }
-      }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `Failed to fetch 4h data for ${pair}`, { error: message });
-    }
-    supplementary.push({ name: "mtf_4h", passed: mtfOk });
+    // S3. マルチタイムフレーム一致度スコア（15m/1h/4h/日足の方向一致度）
+    const targetSide = direction === "long" ? "buy" as const : "sell" as const;
+    const mtfResult = await calculateMTFScore(exchange, pair, targetSide, logger);
+    // スコア 0.75 以上（4時間足中3つ以上が同方向）で通過
+    const mtfOk = mtfResult.score >= 0.75;
+    supplementary.push({ name: "mtf_alignment", passed: mtfOk });
 
-    // S4. ADXレジーム判定（GPTの代わりにテクニカルで判定、トークンコスト0）
-    const adx = calculateADX(confirmedCandles, INDICATOR.ADX_PERIOD);
-    const adxOk = adx > INDICATOR.ADX_TREND_THRESHOLD;
-    supplementary.push({ name: "adx_trending", passed: adxOk });
+    // S4. マーケットレジーム判定（GPT分類 → ADXフォールバック）
+    let regimeOk = false;
+    try {
+      const regimeResult = await gpt.classifyMarketRegime(pair, [...confirmedCandles]);
+      regimeOk = regimeResult.regime === "TRENDING" && regimeResult.confidence >= 0.6;
+      logger.debug(BOT_NAME, `GPT regime for ${pair}: ${regimeResult.regime} (confidence: ${regimeResult.confidence.toFixed(2)})`, {
+        regime: regimeResult.regime,
+        confidence: regimeResult.confidence,
+        reasoning: regimeResult.reasoning,
+      });
+    } catch (err: unknown) {
+      // GPT失敗時はADXフォールバック
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(BOT_NAME, `GPT regime classification failed, falling back to ADX`, { error: message });
+      const adx = calculateADX(confirmedCandles, INDICATOR.ADX_PERIOD);
+      regimeOk = adx > INDICATOR.ADX_TREND_THRESHOLD;
+    }
+    supplementary.push({ name: "regime_trending", passed: regimeOk });
 
     const passedCount = supplementary.filter((s) => s.passed).length;
     const passedNames = supplementary.filter((s) => s.passed).map((s) => s.name);
@@ -352,7 +356,7 @@ export function createMomentumBot(deps: {
       failed: failedNames,
     });
 
-    return { passed: passedCount >= REQUIRED_SUPPLEMENTARY, passedCount };
+    return { passed: passedCount >= REQUIRED_SUPPLEMENTARY, passedCount, mtfScore: mtfResult.score };
   }
 
   /**
@@ -401,7 +405,7 @@ export function createMomentumBot(deps: {
     }
 
     // 参考指標評価
-    const { passed } = await evaluateSupplementary(pair, confirmedCandles, direction);
+    const { passed, mtfScore } = await evaluateSupplementary(pair, confirmedCandles, direction);
     if (!passed) return;
 
     // 価格取得（ロング: ask / ショート: bid）
@@ -409,9 +413,11 @@ export function createMomentumBot(deps: {
     const ticker = await client.fetchTicker(pair);
     const entryPrice = isLong ? ticker.ask : ticker.bid;
 
+    // MTFスコアに基づくポジションサイズ調整（全一致=100%, 3/4一致=70%）
+    const mtfSizeMultiplier = mtfScore >= 1.0 ? 1.0 : 0.7;
     const amount = calculatePositionSize({
       capitalUsd,
-      capitalRatio: MOMENTUM_CONFIG.capitalRatio,
+      capitalRatio: MOMENTUM_CONFIG.capitalRatio * mtfSizeMultiplier,
       price: entryPrice,
     });
 
