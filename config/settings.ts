@@ -190,4 +190,10 @@ export const INDICATOR = {
   /** 短期モメンタム用 EMA */
   FAST_EMA_SHORT_PERIOD: 9,
   FAST_EMA_LONG_PERIOD: 21,
+  /** MTFスコア: この値以上で補助条件通過（0.75 = 4時間足中3つ以上が同方向） */
+  MTF_ALIGNMENT_THRESHOLD: 0.75,
+  /** ボリュームスコア: この値以上で補助条件通過（0.5 = spike以上） */
+  VOLUME_SCORE_THRESHOLD: 0.5,
+  /** GPTレジーム分類: confidence がこの値以上で採用 */
+  GPT_REGIME_CONFIDENCE_THRESHOLD: 0.6,
 } as const;

@@ -4,6 +4,7 @@ import {
 } from "../types/index.js";
 import type { NewsFetcher } from "../core/news.js";
 import { RANGE_CONFIG, INDICATOR } from "../config/settings.js";
+import { checkMarketRegime } from "../core/indicators.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -392,9 +393,10 @@ export function createRangeBot(deps: {
     const bbWidth = calculateBBWidth(bb);
     supplementary.push({ name: "bb_squeeze", passed: bbWidth <= INDICATOR.BB_SQUEEZE_THRESHOLD });
 
-    // S2. ADXトレンドフィルター
+    // S2. マーケットレジーム判定（GPT分類 → ADXフォールバック）
     const adx = calculateADX(candles, INDICATOR.ADX_PERIOD);
-    supplementary.push({ name: "adx_range", passed: adx <= INDICATOR.ADX_TREND_THRESHOLD });
+    const regimeRanging = await checkMarketRegime(gpt, pair, candles, "RANGING", adx, logger);
+    supplementary.push({ name: "regime_ranging", passed: regimeRanging });
 
     // S3. Polymarket確率フィルター（GPTの代わりにPolymarketの確率で判定、トークンコスト0）
     const polymarketContradicts = newsFetcher.isPolymarketContradicting(pair, side);

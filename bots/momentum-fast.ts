@@ -17,6 +17,7 @@ import {
 } from "../types/index.js";
 import { MOMENTUM_FAST_CONFIG, INDICATOR } from "../config/settings.js";
 import { calculateEMA, calculateMACD, detectSignal, isVolumeConfirmed } from "./momentum.js";
+import { analyzeVolume } from "../core/indicators.js";
 import {
   calculatePositionSize,
   calculatePnl,
@@ -198,10 +199,15 @@ export function createMomentumFastBot(deps: {
     }
 
     // 参考指標（2つ中1つ以上）
-    const volumeOk = isVolumeConfirmed(confirmedCandles);
+    const volAnalysis = analyzeVolume(confirmedCandles, INDICATOR.VOLUME_LOOKBACK, INDICATOR.VOLUME_MULTIPLIER);
+    const volumeOk = volAnalysis.score >= INDICATOR.VOLUME_SCORE_THRESHOLD;
     const atrOk = isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD);
     if (!volumeOk && !atrOk) {
-      logger.debug(BOT_NAME, `No supplementary signal for ${direction} on ${pair}, skipping`);
+      logger.debug(BOT_NAME, `No supplementary signal for ${direction} on ${pair}, skipping`, {
+        volumeScore: volAnalysis.score,
+        volumeTrend: volAnalysis.trend,
+        volumePattern: volAnalysis.pattern,
+      });
       return;
     }
 
