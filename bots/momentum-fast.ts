@@ -200,7 +200,7 @@ export function createMomentumFastBot(deps: {
 
     // 参考指標（2つ中1つ以上）
     const volAnalysis = analyzeVolume(confirmedCandles, INDICATOR.VOLUME_LOOKBACK, INDICATOR.VOLUME_MULTIPLIER);
-    const volumeOk = volAnalysis.score >= 0.5;
+    const volumeOk = volAnalysis.score >= INDICATOR.VOLUME_SCORE_THRESHOLD;
     const atrOk = isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD);
     if (!volumeOk && !atrOk) {
       logger.debug(BOT_NAME, `No supplementary signal for ${direction} on ${pair}, skipping`, {

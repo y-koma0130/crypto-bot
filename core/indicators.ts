@@ -1,4 +1,5 @@
-import type { Exchange, OHLCV, TradingPair, Timeframe, Logger } from "../types/index.js";
+import type { Exchange, GPTClient, MarketRegime, OHLCV, TradingPair, Timeframe, Logger } from "../types/index.js";
+import { INDICATOR } from "../config/settings.js";
 
 /**
  * Compute Exponential Moving Average for a candle series.
@@ -70,13 +71,15 @@ export async function calculateMTFScore(
   pair: TradingPair,
   targetDirection: "buy" | "sell",
   logger: Logger,
+  preloadedCandles?: ReadonlyMap<Timeframe, readonly OHLCV[]>,
 ): Promise<MTFScoreResult> {
   const details: { timeframe: Timeframe; direction: "buy" | "sell" | null }[] = [];
 
   await Promise.all(
     MTF_TIMEFRAMES.map(async ({ timeframe, emaPeriod, candleLimit }) => {
       try {
-        const candles = await exchange.fetchOHLCV(pair, timeframe, candleLimit);
+        const candles = preloadedCandles?.get(timeframe)
+          ?? await exchange.fetchOHLCV(pair, timeframe, candleLimit);
         if (candles.length < emaPeriod) {
           details.push({ timeframe, direction: null });
           return;
@@ -206,4 +209,35 @@ export function analyzeVolume(
   else if (pattern === "spike") score += 0.2;
 
   return { aboveAverage, trend, pattern, score: Math.min(1, score) };
+}
+
+// ── GPTマーケットレジーム分類（共通ヘルパー） ──
+
+/**
+ * GPTでマーケットレジームを分類し、期待レジームと一致するか判定する。
+ * GPT失敗時は adxFallbackValue を使ってADXベースの判定にフォールバック。
+ */
+export async function checkMarketRegime(
+  gpt: GPTClient,
+  pair: TradingPair,
+  candles: readonly OHLCV[],
+  expectedRegime: MarketRegime,
+  adxValue: number,
+  logger: Logger,
+): Promise<boolean> {
+  try {
+    const result = await gpt.classifyMarketRegime(pair, [...candles]);
+    logger.debug("system", `GPT regime for ${pair}: ${result.regime} (confidence: ${result.confidence.toFixed(2)})`, {
+      regime: result.regime,
+      confidence: result.confidence,
+      reasoning: result.reasoning,
+    });
+    return result.regime === expectedRegime && result.confidence >= INDICATOR.GPT_REGIME_CONFIDENCE_THRESHOLD;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn("system", `GPT regime classification failed, falling back to ADX`, { error: message });
+    return expectedRegime === "TRENDING"
+      ? adxValue > INDICATOR.ADX_TREND_THRESHOLD
+      : adxValue <= INDICATOR.ADX_TREND_THRESHOLD;
+  }
 }

@@ -24,7 +24,7 @@ import {
 } from "../core/risk.js";
 
 // Re-export from shared module for backward compatibility
-import { calculateEMA, calculateMTFScore, analyzeVolume } from "../core/indicators.js";
+import { calculateEMA, calculateMTFScore, analyzeVolume, checkMarketRegime } from "../core/indicators.js";
 export { calculateEMA };
 
 // ── MACD calculation (pure function, exported for testing) ──
@@ -314,37 +314,24 @@ export function createMomentumBot(deps: {
 
     // S1. 出来高加重分析（トレンド・パターンを加味したスコアリング）
     const volAnalysis = analyzeVolume(confirmedCandles, INDICATOR.VOLUME_LOOKBACK, INDICATOR.VOLUME_MULTIPLIER);
-    // スコア 0.5 以上で通過（sustained + increasing = 1.0、spike のみ = 0.5）
-    supplementary.push({ name: "volume_weighted", passed: volAnalysis.score >= 0.5 });
+    // スコア閾値以上で通過（sustained + increasing = 1.0、spike のみ = 0.5）
+    supplementary.push({ name: "volume_weighted", passed: volAnalysis.score >= INDICATOR.VOLUME_SCORE_THRESHOLD });
     logger.debug(BOT_NAME, `Volume analysis for ${pair}: score=${volAnalysis.score.toFixed(2)}, trend=${volAnalysis.trend}, pattern=${volAnalysis.pattern}`);
 
     // S2. ATRボラティリティ拡大
     supplementary.push({ name: "atr", passed: isVolatilityExpanding(confirmedCandles, INDICATOR.ATR_PERIOD) });
 
     // S3. マルチタイムフレーム一致度スコア（15m/1h/4h/日足の方向一致度）
+    // 1h足は既に取得済みなので再利用してAPI呼び出しを削減
     const targetSide = direction === "long" ? "buy" as const : "sell" as const;
-    const mtfResult = await calculateMTFScore(exchange, pair, targetSide, logger);
-    // スコア 0.75 以上（4時間足中3つ以上が同方向）で通過
-    const mtfOk = mtfResult.score >= 0.75;
+    const preloaded = new Map([["1h" as const, confirmedCandles]]);
+    const mtfResult = await calculateMTFScore(exchange, pair, targetSide, logger, preloaded);
+    const mtfOk = mtfResult.score >= INDICATOR.MTF_ALIGNMENT_THRESHOLD;
     supplementary.push({ name: "mtf_alignment", passed: mtfOk });
 
     // S4. マーケットレジーム判定（GPT分類 → ADXフォールバック）
-    let regimeOk = false;
-    try {
-      const regimeResult = await gpt.classifyMarketRegime(pair, [...confirmedCandles]);
-      regimeOk = regimeResult.regime === "TRENDING" && regimeResult.confidence >= 0.6;
-      logger.debug(BOT_NAME, `GPT regime for ${pair}: ${regimeResult.regime} (confidence: ${regimeResult.confidence.toFixed(2)})`, {
-        regime: regimeResult.regime,
-        confidence: regimeResult.confidence,
-        reasoning: regimeResult.reasoning,
-      });
-    } catch (err: unknown) {
-      // GPT失敗時はADXフォールバック
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(BOT_NAME, `GPT regime classification failed, falling back to ADX`, { error: message });
-      const adx = calculateADX(confirmedCandles, INDICATOR.ADX_PERIOD);
-      regimeOk = adx > INDICATOR.ADX_TREND_THRESHOLD;
-    }
+    const adx = calculateADX(confirmedCandles, INDICATOR.ADX_PERIOD);
+    const regimeOk = await checkMarketRegime(gpt, pair, confirmedCandles, "TRENDING", adx, logger);
     supplementary.push({ name: "regime_trending", passed: regimeOk });
 
     const passedCount = supplementary.filter((s) => s.passed).length;

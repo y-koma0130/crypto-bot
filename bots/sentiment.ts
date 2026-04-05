@@ -70,10 +70,11 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
     // Phase 1: ニュースデータ取得 + GPTセンチメント分析
     await newsFetcher.refresh();
 
-    // 1a. キーワードHALTの即時チェック（GPT待ち不要で緊急停止）
-    let haltDetected = false;
+    // 1a. キーワードHALTの即時チェック + フォールバック用にキャッシュ
+    const keywordResults = new Map<TradingPair, PolymarketSentiment>();
     for (const pair of SENTIMENT_CONFIG.pairs) {
       const keywordLevel = newsFetcher.getSentiment(pair);
+      keywordResults.set(pair, keywordLevel);
       if (keywordLevel === "HALT") {
         const haltResult: SentimentResult = {
           level: "HALT",
@@ -81,7 +82,6 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
           timestamp: Date.now(),
         };
         sentimentMap.set(pair, haltResult);
-        haltDetected = true;
         logger.warn(BOT_NAME, `HALT detected on ${pair} — blocking new entries for all bots`, {
           reasoning: haltResult.reasoning,
         });
@@ -99,16 +99,18 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
 
     // 1b. HALT以外のペアはGPTでセンチメント分析
     const nonHaltPairs = SENTIMENT_CONFIG.pairs.filter(
-      (pair) => sentimentMap.get(pair)?.level !== "HALT",
+      (pair) => keywordResults.get(pair) !== "HALT",
     );
 
     if (nonHaltPairs.length > 0) {
-      // 各ペアのニュース（Polymarket + RSS）を収集
-      const pairNewsMap = new Map<TradingPair, string[]>();
-      for (const pair of nonHaltPairs) {
-        const news = await newsFetcher.fetchNews(pair);
-        pairNewsMap.set(pair, news);
-      }
+      // 各ペアのニュース（Polymarket + RSS）を並列収集
+      const newsEntries = await Promise.all(
+        nonHaltPairs.map(async (pair) => {
+          const news = await newsFetcher.fetchNews(pair);
+          return [pair, news] as const;
+        }),
+      );
+      const pairNewsMap = new Map<TradingPair, string[]>(newsEntries);
 
       // GPTバッチ分析を試行、失敗時はキーワードフォールバック
       let gptResults: Map<TradingPair, SentimentResult> | null = null;
@@ -123,26 +125,11 @@ export function createSentimentBot(deps: SentimentBotDeps): SentimentBot {
       }
 
       for (const pair of nonHaltPairs) {
-        let result: SentimentResult;
+        // GPT結果を優先、なければキャッシュ済みキーワード結果をフォールバック
+        const result = gptResults?.get(pair)
+          ?? toSentimentResult(keywordResults.get(pair) ?? "NEUTRAL", pair);
 
-        if (gptResults) {
-          const gptResult = gptResults.get(pair);
-          if (gptResult) {
-            result = gptResult;
-          } else {
-            // GPT結果にペアがない場合はフォールバック
-            const level = newsFetcher.getSentiment(pair);
-            result = toSentimentResult(level, pair);
-          }
-        } else {
-          // GPT全体失敗時はキーワードフォールバック
-          const level = newsFetcher.getSentiment(pair);
-          result = toSentimentResult(level, pair);
-        }
-
-        // GPTがHALTを返した場合も尊重
         if (result.level === "HALT") {
-          haltDetected = true;
           logger.warn(BOT_NAME, `GPT HALT detected on ${pair}`, { reasoning: result.reasoning });
         }
 
